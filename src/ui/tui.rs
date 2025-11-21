@@ -1,4 +1,4 @@
-//! Ratatui-based interface placeholder wired to basic search.
+//! Ratatui-based interface wired to Tantivy search (basic).
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
