@@ -37,9 +37,7 @@ impl TantivyIndex {
         let writer = index
             .writer(50_000_000)
             .with_context(|| "create index writer")?;
-
         let fields = fields_from_schema(&schema)?;
-
         Ok(Self {
             index,
             writer,
@@ -92,28 +90,19 @@ pub fn build_schema() -> Schema {
 }
 
 pub fn fields_from_schema(schema: &Schema) -> Result<Fields> {
+    let get = |name: &str| {
+        schema
+            .get_field(name)
+            .ok_or_else(|| anyhow!("schema missing {}", name))
+    };
     Ok(Fields {
-        agent: schema
-            .get_field("agent")
-            .ok_or_else(|| anyhow::anyhow!("schema missing agent"))?,
-        workspace: schema
-            .get_field("workspace")
-            .ok_or_else(|| anyhow::anyhow!("schema missing workspace"))?,
-        source_path: schema
-            .get_field("source_path")
-            .ok_or_else(|| anyhow::anyhow!("schema missing source_path"))?,
-        msg_idx: schema
-            .get_field("msg_idx")
-            .ok_or_else(|| anyhow::anyhow!("schema missing msg_idx"))?,
-        created_at: schema
-            .get_field("created_at")
-            .ok_or_else(|| anyhow::anyhow!("schema missing created_at"))?,
-        title: schema
-            .get_field("title")
-            .ok_or_else(|| anyhow::anyhow!("schema missing title"))?,
-        content: schema
-            .get_field("content")
-            .ok_or_else(|| anyhow::anyhow!("schema missing content"))?,
+        agent: get("agent")?,
+        workspace: get("workspace")?,
+        source_path: get("source_path")?,
+        msg_idx: get("msg_idx")?,
+        created_at: get("created_at")?,
+        title: get("title")?,
+        content: get("content")?,
     })
 }
 
