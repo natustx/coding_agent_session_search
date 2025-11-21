@@ -10,8 +10,17 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use connectors::{cline::ClineConnector, codex::CodexConnector, Connector, NormalizedConversation};
-use directories::ProjectDirs;
+use connectors::{
+    amp::AmpConnector,
+    claude_code::ClaudeCodeConnector,
+    cline::ClineConnector,
+    codex::CodexConnector,
+    gemini::GeminiConnector,
+    opencode::OpenCodeConnector,
+    Connector,
+    NormalizedConversation,
+};
+use indexer::IndexOptions;
 use model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use storage::sqlite::SqliteStorage;
 
@@ -40,6 +49,10 @@ pub enum Commands {
         /// Perform full rebuild
         #[arg(long)]
         full: bool,
+
+        /// Watch for changes and reindex automatically
+        #[arg(long)]
+        watch: bool,
     },
 }
 
@@ -48,41 +61,20 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Tui => ui::tui::run_tui(),
-        Commands::Index { full } => run_index(cli.db, full),
+        Commands::Index { full, watch } => run_index(cli.db, full, watch),
     }
 }
 
-fn run_index(db_override: Option<PathBuf>, full: bool) -> Result<()> {
+fn run_index(db_override: Option<PathBuf>, full: bool, watch: bool) -> Result<()> {
     let db_path = db_override.unwrap_or_else(default_db_path);
-    let mut storage = SqliteStorage::open(&db_path)?;
-
-    let connectors: Vec<Box<dyn Connector>> = vec![
-        Box::new(CodexConnector::new()),
-        Box::new(ClineConnector::new()),
-    ];
-
-    for conn in connectors {
-        let detect = conn.detect();
-        if !detect.detected {
-            continue;
-        }
-
-        let ctx = connectors::ScanContext {
-            data_root: dirs::home_dir().unwrap_or_default(),
-            since_ts: None,
-        };
-
-        let convs = conn.scan(&ctx)?;
-        for conv in convs {
-            persist_conversation(&mut storage, &conv)?;
-        }
-    }
-
-    if full {
-        tracing::info!(target: "index", "full index run complete (partial connectors)");
-    }
-
-    Ok(())
+    let data_dir = default_data_dir();
+    let opts = IndexOptions {
+        full,
+        watch,
+        db_path,
+        data_dir,
+    };
+    indexer::run_index(opts)
 }
 
 fn persist_conversation(storage: &mut SqliteStorage, conv: &NormalizedConversation) -> Result<()> {
@@ -143,7 +135,12 @@ fn map_role(role: &str) -> MessageRole {
 }
 
 fn default_db_path() -> PathBuf {
-    let dirs = directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search")
-        .expect("project dirs available");
-    dirs.data_dir().join("agent_search.db")
+    default_data_dir().join("agent_search.db")
+}
+
+fn default_data_dir() -> PathBuf {
+    directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search")
+        .expect("project dirs available")
+        .data_dir()
+        .to_path_buf()
 }

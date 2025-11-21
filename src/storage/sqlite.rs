@@ -1,8 +1,8 @@
 //! SQLite backend: schema, pragmas, and migrations.
 
 use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
-use anyhow::{anyhow, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use anyhow::{Context, Result, anyhow};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -164,16 +164,16 @@ impl SqliteStorage {
     ) -> Result<i64> {
         let tx = self.conn.transaction()?;
 
-        if let Some(ext) = &conv.external_id {
-            if let Some(existing): Option<i64> = tx
+        if let Some(ext) = &conv.external_id
+            && let Some(existing) = tx
                 .query_row(
                     "SELECT id FROM conversations WHERE agent_id = ? AND external_id = ?",
                     params![agent_id, ext],
                     |row| row.get(0),
                 )
-                .optional()? {
-                return Ok(existing);
-            }
+                .optional()?
+        {
+            return Ok(existing);
         }
 
         let conv_id = insert_conversation(&tx, agent_id, workspace_id, conv)?;
