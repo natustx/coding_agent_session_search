@@ -21,11 +21,13 @@ jobs:
         run: cargo test
       - name: benches (run, quick)
         run: cargo bench --bench runtime_perf --bench search_perf --bench index_perf -- --test-threads=1 --sample-size=10 --warm-up-time 0.05 --measurement-time 0.2
-      - name: UBS (changed files only, if available)
+      - name: Install UBS
         run: |
-          if [ -x ./ubs ]; then
-            CHANGED=$(git diff --name-only origin/main...HEAD | tr '\n' ' ')
-            if [ -n "$CHANGED" ]; then ./ubs $CHANGED || true; fi
-          fi
+          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh?$(date +%s)" \
+            | bash -s -- --easy-mode
+      - name: UBS (changed files only)
+        run: |
+          CHANGED=$(git diff --name-only origin/main...HEAD | tr '\n' ' ')
+          if [ -n "$CHANGED" ]; then ./ubs $CHANGED; fi
       - name: ratatui snapshot + hotkey tests
         run: cargo test --tests -- ui_
