@@ -15,6 +15,7 @@ pub enum MessageRole {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
+    pub id: Option<i64>,
     pub slug: String,
     pub name: String,
     pub version: Option<String>,
@@ -30,14 +31,14 @@ pub enum AgentKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
-    pub id: i64,
+    pub id: Option<i64>,
     pub path: PathBuf,
     pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
-    pub id: i64,
+    pub id: Option<i64>,
     pub agent_slug: String,
     pub workspace: Option<PathBuf>,
     pub external_id: Option<String>,
@@ -52,6 +53,7 @@ pub struct Conversation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    pub id: Option<i64>,
     pub idx: i64,
     pub role: MessageRole,
     pub author: Option<String>,
@@ -63,6 +65,7 @@ pub struct Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snippet {
+    pub id: Option<i64>,
     pub file_path: Option<PathBuf>,
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
@@ -72,6 +75,6 @@ pub struct Snippet {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {
-    pub id: i64,
+    pub id: Option<i64>,
     pub name: String,
 }

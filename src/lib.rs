@@ -7,7 +7,7 @@ pub mod storage;
 pub mod ui;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use indexer::IndexOptions;
 use std::path::PathBuf;
 
@@ -45,6 +45,13 @@ pub enum Commands {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Generate shell completions to stdout
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Generate man page to stdout
+    Man,
 }
 
 pub async fn run() -> Result<()> {
@@ -57,6 +64,23 @@ pub async fn run() -> Result<()> {
             watch,
             data_dir,
         } => run_index_with_data(cli.db, full, watch, data_dir),
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(
+                shell,
+                &mut cmd,
+                "coding-agent-search",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
+        Commands::Man => {
+            let cmd = Cli::command();
+            let man = clap_mangen::Man::new(cmd);
+            let mut out = std::io::stdout();
+            man.render(&mut out)?;
+            Ok(())
+        }
     }
 }
 

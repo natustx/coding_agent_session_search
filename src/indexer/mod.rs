@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use notify::{RecursiveMode, Watcher, recommended_watcher};
@@ -23,6 +23,11 @@ pub struct IndexOptions {
 pub fn run_index(opts: IndexOptions) -> Result<()> {
     let mut storage = SqliteStorage::open(&opts.db_path)?;
     let mut t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir)?)?;
+
+    if opts.full {
+        reset_storage(&mut storage)?;
+        t_index.delete_all()?;
+    }
 
     let connectors: Vec<Box<dyn Connector>> = vec![
         Box::new(CodexConnector::new()),
@@ -49,11 +54,9 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
     t_index.commit()?;
 
     if opts.watch {
-        watch_sources(move || {
-            let _ = run_index(IndexOptions {
-                watch: false,
-                ..opts.clone()
-            });
+        let opts_clone = opts.clone();
+        watch_sources(move |paths| {
+            let _ = reindex_paths(&opts_clone, paths);
         })?;
     }
 
@@ -71,10 +74,11 @@ fn ingest_batch(
     Ok(())
 }
 
-fn watch_sources<F: Fn() + Send + 'static>(callback: F) -> Result<()> {
+fn watch_sources<F: Fn(Vec<PathBuf>) + Send + 'static>(callback: F) -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
-            callback();
+        if let Ok(event) = res {
+            let _ = tx.send(event.paths);
         }
     })?;
 
@@ -82,8 +86,15 @@ fn watch_sources<F: Fn() + Send + 'static>(callback: F) -> Result<()> {
         let _ = watcher.watch(&dir, RecursiveMode::Recursive);
     }
 
+    let debounce = Duration::from_secs(2);
+    let mut last = Instant::now();
     loop {
-        std::thread::sleep(Duration::from_secs(60));
+        if let Ok(paths) = rx.recv()
+            && last.elapsed() >= debounce
+        {
+            callback(paths);
+            last = Instant::now();
+        }
     }
 }
 
@@ -99,7 +110,148 @@ fn watch_roots() -> Vec<PathBuf> {
         dirs::home_dir()
             .unwrap_or_default()
             .join(".claude/projects"),
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".config/Code/User/globalStorage/sourcegraph.amp"),
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("amp"),
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(".opencode"),
+        dirs::home_dir().unwrap_or_default().join(".opencode"),
     ]
+}
+
+fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
+    storage.raw().execute_batch(
+        r#"
+        DELETE FROM fts_messages;
+        DELETE FROM snippets;
+        DELETE FROM messages;
+        DELETE FROM conversations;
+        DELETE FROM agents;
+        DELETE FROM workspaces;
+        DELETE FROM tags;
+        DELETE FROM conversation_tags;
+    "#,
+    )?;
+    Ok(())
+}
+
+fn reindex_paths(opts: &IndexOptions, paths: Vec<PathBuf>) -> Result<()> {
+    let mut storage = SqliteStorage::open(&opts.db_path)?;
+    let mut t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir)?)?;
+
+    let triggers = classify_paths(paths);
+    let mut connectors: Vec<Box<dyn Connector>> = Vec::new();
+    if triggers.codex.is_some() {
+        connectors.push(Box::new(CodexConnector::new()));
+    }
+    if triggers.cline.is_some() {
+        connectors.push(Box::new(ClineConnector::new()));
+    }
+    if triggers.gemini.is_some() {
+        connectors.push(Box::new(GeminiConnector::new()));
+    }
+    if triggers.claude.is_some() {
+        connectors.push(Box::new(ClaudeCodeConnector::new()));
+    }
+    if triggers.amp.is_some() {
+        connectors.push(Box::new(AmpConnector::new()));
+    }
+    if triggers.opencode.is_some() {
+        connectors.push(Box::new(OpenCodeConnector::new()));
+    }
+
+    for (conn, since_ts) in triggers.connectors_with_since() {
+        let detect = conn.detect();
+        if !detect.detected {
+            continue;
+        }
+        let ctx = crate::connectors::ScanContext {
+            data_root: opts.data_dir.clone(),
+            since_ts,
+        };
+        let convs = conn.scan(&ctx)?;
+        ingest_batch(&mut storage, &mut t_index, convs)?;
+    }
+    t_index.commit()?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct PathTriggers {
+    codex: Option<i64>,
+    cline: Option<i64>,
+    gemini: Option<i64>,
+    claude: Option<i64>,
+    amp: Option<i64>,
+    opencode: Option<i64>,
+}
+
+impl PathTriggers {
+    fn connectors_with_since(self) -> Vec<(Box<dyn Connector>, Option<i64>)> {
+        let mut v: Vec<(Box<dyn Connector>, Option<i64>)> = Vec::new();
+        if let Some(ts) = self.codex {
+            v.push((Box::new(CodexConnector::new()), Some(ts)));
+        }
+        if let Some(ts) = self.cline {
+            v.push((Box::new(ClineConnector::new()), Some(ts)));
+        }
+        if let Some(ts) = self.gemini {
+            v.push((Box::new(GeminiConnector::new()), Some(ts)));
+        }
+        if let Some(ts) = self.claude {
+            v.push((Box::new(ClaudeCodeConnector::new()), Some(ts)));
+        }
+        if let Some(ts) = self.amp {
+            v.push((Box::new(AmpConnector::new()), Some(ts)));
+        }
+        if let Some(ts) = self.opencode {
+            v.push((Box::new(OpenCodeConnector::new()), Some(ts)));
+        }
+        v
+    }
+}
+
+fn classify_paths(paths: Vec<PathBuf>) -> PathTriggers {
+    let mut t = PathTriggers::default();
+    let mut max_mtime: Option<i64> = None;
+    for p in paths {
+        let s = p.to_string_lossy();
+
+        if let Ok(meta) = std::fs::metadata(&p)
+            && let Ok(time) = meta.modified()
+            && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
+        {
+            let ts = dur.as_millis() as i64;
+            max_mtime = Some(max_mtime.map_or(ts, |m| m.max(ts)));
+            // assign per-connector specific mtime
+            if s.contains(".codex") || s.contains("codex/sessions") || s.contains("rollout-") {
+                t.codex = Some(ts);
+            }
+            if s.contains("saoudrizwan.claude-dev") || s.contains("cline") {
+                t.cline = Some(ts);
+            }
+            if s.contains(".gemini/tmp") {
+                t.gemini = Some(ts);
+            }
+            if s.contains(".claude/projects")
+                || s.ends_with(".claude")
+                || s.ends_with(".claude.json")
+            {
+                t.claude = Some(ts);
+            }
+            if s.contains("sourcegraph.amp") || s.contains("/amp/") {
+                t.amp = Some(ts);
+            }
+            if s.contains(".opencode") || s.contains("/opencode/") {
+                t.opencode = Some(ts);
+            }
+        }
+    }
+    t
 }
 
 pub mod persist {
@@ -108,7 +260,7 @@ pub mod persist {
     use crate::connectors::NormalizedConversation;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::tantivy::TantivyIndex;
-    use crate::storage::sqlite::SqliteStorage;
+    use crate::storage::sqlite::{InsertOutcome, SqliteStorage};
 
     pub fn persist_conversation(
         storage: &mut SqliteStorage,
@@ -116,6 +268,7 @@ pub mod persist {
         conv: &NormalizedConversation,
     ) -> Result<()> {
         let agent = Agent {
+            id: None,
             slug: conv.agent_slug.clone(),
             name: conv.agent_slug.clone(),
             version: None,
@@ -129,10 +282,11 @@ pub mod persist {
             None
         };
 
-        let messages = conv
+        let messages: Vec<Message> = conv
             .messages
             .iter()
             .map(|m| Message {
+                id: None,
                 idx: m.idx,
                 role: map_role(&m.role),
                 author: m.author.clone(),
@@ -144,7 +298,7 @@ pub mod persist {
             .collect();
 
         let conversation = Conversation {
-            id: 0,
+            id: None,
             agent_slug: conv.agent_slug.clone(),
             workspace: conv.workspace.clone(),
             external_id: conv.external_id.clone(),
@@ -157,8 +311,20 @@ pub mod persist {
             messages,
         };
 
-        let _ = storage.insert_conversation_tree(agent_id, workspace_id, &conversation)?;
-        t_index.add_conversation(conv)?;
+        let InsertOutcome {
+            conversation_id: _,
+            inserted_indices,
+        } = storage.insert_conversation_tree(agent_id, workspace_id, &conversation)?;
+
+        if !inserted_indices.is_empty() {
+            let new_msgs: Vec<_> = conv
+                .messages
+                .iter()
+                .filter(|m| inserted_indices.contains(&m.idx))
+                .cloned()
+                .collect();
+            t_index.add_messages(conv, &new_msgs)?;
+        }
         Ok(())
     }
 
