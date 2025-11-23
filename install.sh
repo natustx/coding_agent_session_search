@@ -3,7 +3,7 @@ set -euo pipefail
 umask 022
 shopt -s lastpipe 2>/dev/null || true
 
-VERSION="${VERSION:-v0.1.0}"
+VERSION="${VERSION:-}"
 OWNER="${OWNER:-coding-agent-search}"
 REPO="${REPO:-coding-agent-search}"
 DEST_DEFAULT="$HOME/.local/bin"
@@ -24,6 +24,23 @@ info() { log "\033[0;34m→\033[0m $*"; }
 ok() { log "\033[0;32m✓\033[0m $*"; }
 warn() { log "\033[1;33m⚠\033[0m $*"; }
 err() { log "\033[0;31m✗\033[0m $*"; }
+
+resolve_version() {
+  if [ -n "$VERSION" ]; then return 0; fi
+  
+  info "Resolving latest version..."
+  local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
+  local tag
+  tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+  
+  if [ -n "$tag" ]; then
+    VERSION="$tag"
+    info "Resolved latest version: $VERSION"
+  else
+    VERSION="v0.1.0"
+    warn "Could not resolve latest version from GitHub API; defaulting to $VERSION"
+  fi
+}
 
 maybe_add_path() {
   case ":$PATH:" in
@@ -82,6 +99,8 @@ while [ $# -gt 0 ]; do
     *) shift;;
   esac
 done
+
+resolve_version
 
 mkdir -p "$DEST"
 OS=$(uname -s | tr 'A-Z' 'a-z')
