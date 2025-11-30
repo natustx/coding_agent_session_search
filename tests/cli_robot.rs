@@ -99,3 +99,185 @@ fn search_error_writes_trace() {
     assert_eq!(exit_code, code as i64);
     assert_eq!(json["contract_version"], "1");
 }
+
+// ============================================================
+// yln.5: E2E Search Tests with Fixture Data
+// ============================================================
+
+#[test]
+fn search_returns_json_results() {
+    // E2E test: search with JSON output returns structured results (yln.5)
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "hello",
+        "--json",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse JSON output
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
+
+    // Verify structure
+    assert!(json["count"].is_number(), "JSON should have count field");
+    assert!(json["hits"].is_array(), "JSON should have hits array");
+    assert!(json["count"].as_u64().unwrap() > 0, "Should find results for 'hello'");
+
+    // Verify hit structure
+    let hits = json["hits"].as_array().unwrap();
+    let first_hit = &hits[0];
+    assert!(first_hit["agent"].is_string(), "Hit should have agent");
+    assert!(first_hit["source_path"].is_string(), "Hit should have source_path");
+    assert!(first_hit["score"].is_number(), "Hit should have score");
+}
+
+#[test]
+fn search_respects_limit() {
+    // E2E test: --limit restricts results (yln.5)
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "Gemini",
+        "--json",
+        "--limit",
+        "1",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    let hits = json["hits"].as_array().expect("hits array");
+    assert!(hits.len() <= 1, "Limit should restrict results to at most 1");
+}
+
+#[test]
+fn search_empty_query_returns_all() {
+    // E2E test: empty query returns recent results (yln.5)
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "",
+        "--json",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    // Empty query should return results (recent conversations)
+    assert!(json["hits"].is_array(), "Should return hits array");
+}
+
+#[test]
+fn search_no_match_returns_empty_hits() {
+    // E2E test: non-matching query returns empty results (yln.5)
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "xyznonexistentquery12345",
+        "--json",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    let count = json["count"].as_u64().expect("count field");
+    assert_eq!(count, 0, "Non-matching query should return 0 results");
+
+    let hits = json["hits"].as_array().expect("hits array");
+    assert!(hits.is_empty(), "Hits array should be empty");
+}
+
+#[test]
+fn search_writes_trace_on_success() {
+    // E2E test: trace file captures successful search (yln.5)
+    let tmp = TempDir::new().unwrap();
+    let trace_path = tmp.path().join("search_trace.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "--trace-file",
+        trace_path.to_str().unwrap(),
+        "search",
+        "hello",
+        "--json",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+
+    cmd.assert().success();
+
+    // Verify trace file was written
+    let trace = fs::read_to_string(&trace_path).expect("trace file exists");
+    assert!(!trace.is_empty(), "Trace file should have content");
+
+    // Parse last line as JSON
+    let last_line = trace.lines().last().expect("trace has lines");
+    let json: Value = serde_json::from_str(last_line).expect("valid trace JSON");
+    assert_eq!(json["exit_code"], 0, "Successful search should have exit_code 0");
+    assert_eq!(json["contract_version"], "1");
+}
+
+#[test]
+fn search_json_includes_match_type() {
+    // E2E test: JSON results include match_type field (yln.5)
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "hello",
+        "--json",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    let hits = json["hits"].as_array().expect("hits array");
+    if !hits.is_empty() {
+        let first_hit = &hits[0];
+        assert!(
+            first_hit["match_type"].is_string(),
+            "Hit should include match_type (exact/wildcard/fuzzy)"
+        );
+    }
+}
+
+#[test]
+fn search_robot_format_is_valid_json_lines() {
+    // E2E test: --robot output is JSON lines format (yln.5)
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "hello",
+        "--robot",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Robot mode should output JSON (same as --json)
+    let json: Value = serde_json::from_str(stdout.trim()).expect("robot output should be valid JSON");
+    assert!(json["hits"].is_array(), "Robot output should have hits array");
+}
