@@ -10,19 +10,28 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use once_cell::sync::OnceCell;
 use ratatui::prelude::*;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
 
 use crate::default_data_dir;
 use crate::model::types::MessageRole;
-use crate::search::query::{SearchClient, SearchFilters, SearchHit};
+use crate::search::query::{CacheStats, QuerySuggestion, SearchClient, SearchFilters, SearchHit};
 use crate::search::tantivy::index_dir;
+use crate::ui::components::help_strip;
+use crate::ui::components::palette::{self, PaletteAction, PaletteState};
+use crate::ui::components::pills::{self, Pill};
 use crate::ui::components::theme::ThemePalette;
 use crate::ui::components::widgets::search_bar;
 use crate::ui::data::{ConversationView, InputMode, load_conversation, role_style};
@@ -45,6 +54,9 @@ enum RankingMode {
     RecentHeavy,
     Balanced,
     RelevanceHeavy,
+    MatchQualityHeavy, // Prioritizes exact matches over wildcard/fuzzy
+    DateNewest,        // Pure newest-first (ignores relevance score)
+    DateOldest,        // Pure oldest-first (ignores relevance score)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,15 +96,80 @@ impl ContextWindow {
     }
 }
 
+/// Display density presets for result lists.
+/// Controls lines-per-item and visual spacing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum DensityMode {
+    /// 2 lines per item: header + location. Maximum items visible.
+    Compact,
+    /// 4 lines per item: header + location + 2 snippet lines. Balanced.
+    #[default]
+    Cozy,
+    /// 6 lines per item: header + location + 4 snippet lines. Maximum context.
+    Spacious,
+}
+
+impl DensityMode {
+    fn next(self) -> Self {
+        match self {
+            DensityMode::Compact => DensityMode::Cozy,
+            DensityMode::Cozy => DensityMode::Spacious,
+            DensityMode::Spacious => DensityMode::Compact,
+        }
+    }
+
+    fn lines_per_item(self) -> usize {
+        match self {
+            DensityMode::Compact => 2,
+            DensityMode::Cozy => 4,
+            DensityMode::Spacious => 6,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DensityMode::Compact => "Compact",
+            DensityMode::Cozy => "Cozy",
+            DensityMode::Spacious => "Spacious",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct TuiStatePersisted {
     match_mode: Option<String>,
     context_window: Option<String>,
+    /// Display density: "compact", "cozy", or "spacious".
+    density_mode: Option<String>,
     /// Set to true after user dismisses help overlay for the first time.
     /// Prevents help from auto-showing on subsequent launches.
     has_seen_help: Option<bool>,
     /// Recently used search queries, most recent first. Persisted across sessions.
     query_history: Option<Vec<String>>,
+    /// Saved views (slots 1-9).
+    saved_views: Option<Vec<SavedViewPersisted>>,
+    /// Persist help strip pinned state across runs.
+    help_pinned: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SavedViewPersisted {
+    slot: u8,
+    agents: Vec<String>,
+    workspaces: Vec<String>,
+    created_from: Option<i64>,
+    created_to: Option<i64>,
+    ranking: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SavedView {
+    slot: u8,
+    agents: std::collections::HashSet<String>,
+    workspaces: std::collections::HashSet<String>,
+    created_from: Option<i64>,
+    created_to: Option<i64>,
+    ranking: RankingMode,
 }
 
 #[derive(Clone, Debug)]
@@ -363,17 +440,57 @@ fn contextual_empty_state(
     match_mode: MatchMode,
     palette: ThemePalette,
     fuzzy_suggestion: Option<&str>,
+    query_suggestions: &[QuerySuggestion],
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     // Show the query they searched for
     if query.trim().is_empty() {
         lines.push(Line::from(Span::styled(
-            "No results found".to_string(),
+            "🔍 Ready to search".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
-        lines.push(Line::from("Start typing to search your conversations."));
+        lines.push(Line::from(
+            "Start typing to search your coding conversations.",
+        ));
+        lines.push(Line::from(""));
+
+        // Quick start actions for empty query
+        lines.push(Line::from(Span::styled(
+            "Quick actions:".to_string(),
+            Style::default().fg(palette.accent),
+        )));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "today:",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" — search recent conversations"),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "agent:codex",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" — filter by agent"),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "error*",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" — wildcard search"),
+        ]));
     } else {
         lines.push(Line::from(vec![
             Span::styled(
@@ -405,9 +522,76 @@ fn contextual_empty_state(
                 Span::styled(" ?".to_string(), Style::default().fg(palette.hint)),
             ]));
         }
+
+        // Show actionable suggestions from the search engine (dft.1)
+        if !query_suggestions.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Try instead (press number key):".to_string(),
+                Style::default().fg(palette.accent),
+            )));
+            for sugg in query_suggestions.iter().take(3) {
+                let shortcut = sugg.shortcut.unwrap_or(0);
+                if shortcut > 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {} ", shortcut),
+                            Style::default()
+                                .fg(palette.accent)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(sugg.message.clone(), Style::default().fg(palette.fg)),
+                    ]));
+                }
+            }
+        }
     }
 
     lines.push(Line::from(""));
+
+    // Build quick actions (contextual, actionable)
+    let mut quick_actions: Vec<Line<'static>> = Vec::new();
+
+    // Wildcard suggestion - if query exists and doesn't use wildcards
+    if !query.trim().is_empty() && !query.contains('*') {
+        let base = query.split_whitespace().next().unwrap_or(query);
+        if !base.is_empty() && base.len() <= 20 {
+            quick_actions.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{}*", base),
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" — try prefix wildcard"),
+            ]));
+            quick_actions.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("*{}", base),
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" — try suffix wildcard"),
+            ]));
+        }
+    }
+
+    // Time filter suggestion - if no time filter active
+    if filters.created_from.is_none() && filters.created_to.is_none() && !query.trim().is_empty() {
+        quick_actions.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "F5".to_string(),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" — add time filter (today, this week, etc.)"),
+        ]));
+    }
 
     // Build contextual suggestions
     let mut suggestions: Vec<String> = Vec::new();
@@ -428,7 +612,7 @@ fn contextual_empty_state(
         suggestions.push("Clear workspace filter (Shift+F4)".to_string());
     }
 
-    // Time filter suggestion
+    // Time filter active suggestion
     if filters.created_from.is_some() || filters.created_to.is_some() {
         suggestions.push("Remove time filter (Ctrl+Del clears all)".to_string());
     }
@@ -447,27 +631,58 @@ fn contextual_empty_state(
         suggestions.push("Try fewer keywords".to_string());
     }
 
-    // If still no suggestions, add generic ones
-    if suggestions.is_empty() {
-        suggestions.push("Check spelling".to_string());
-        suggestions.push("Try different keywords".to_string());
-        suggestions.push("Run 'cass index --full' to ensure all data is indexed".to_string());
+    // Render quick actions if any
+    if !quick_actions.is_empty() && !query.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Try instead:".to_string(),
+            Style::default().fg(palette.accent),
+        )));
+        lines.extend(quick_actions);
+        lines.push(Line::from(""));
     }
 
-    // Render suggestions
-    lines.push(Line::from(Span::styled(
-        "Suggestions:".to_string(),
-        Style::default().fg(palette.accent),
-    )));
-    for s in suggestions {
-        lines.push(Line::from(format!("  • {}", s)));
+    // Render suggestions if any
+    if !suggestions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Suggestions:".to_string(),
+            Style::default().fg(palette.hint),
+        )));
+        for s in suggestions {
+            lines.push(Line::from(vec![
+                Span::raw("  • "),
+                Span::styled(s, Style::default().fg(palette.fg)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Index health tip - always show as it's a common issue
+    if !query.trim().is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("💡 ", Style::default()),
+            Span::styled(
+                "Index stale?".to_string(),
+                Style::default().fg(palette.hint),
+            ),
+            Span::raw(" Run "),
+            Span::styled(
+                "cass index --full".to_string(),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" to refresh"),
+        ]));
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Press Ctrl+Del to clear all filters".to_string(),
-        Style::default().fg(palette.hint),
-    )));
+    lines.push(Line::from(vec![
+        Span::styled("Ctrl+Del".to_string(), Style::default().fg(palette.accent)),
+        Span::styled(
+            " clear all filters".to_string(),
+            Style::default().fg(palette.hint),
+        ),
+    ]));
 
     lines
 }
@@ -505,6 +720,13 @@ fn format_relative_time(timestamp_ms: i64) -> String {
     }
 }
 
+/// Formats a timestamp as an absolute string with date and time in UTC.
+fn format_absolute_time(timestamp_ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -522,6 +744,8 @@ fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
         "Search",
         &[
             "type to live-search; / focuses query; Ctrl-R cycles history",
+            "Wildcards: foo* (prefix), *foo (suffix), *foo* (contains)",
+            "Auto-fuzzy: searches with few results try *term* fallback",
             "Ctrl+Shift+R refresh search (re-query index)",
         ],
     ));
@@ -537,8 +761,8 @@ fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
         "Modes",
         &[
             "F9 match mode: prefix (default) ⇄ standard",
-            "F12 ranking: recent-heavy → balanced → relevance-heavy",
-            "F2 theme: dark/light",
+            "F12 ranking: recent → balanced → relevance → match-quality",
+            "F2 theme: dark/light | Ctrl+B toggle border style",
         ],
     ));
     lines.extend(add_section(
@@ -558,6 +782,7 @@ fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
             "Arrows move; Left/Right pane; PgUp/PgDn page",
             "Vim: h/j/k/l (left/down/up/right) when results showing",
             "Alt+NumPad 1-9 jump pane; g/G jump first/last item",
+            "m toggle select; A bulk actions; Esc clears selection",
             "Tab toggles focus (Results ⇄ Detail)",
             "[ / ] cycle detail tabs (Messages/Snippets/Raw)",
         ],
@@ -572,8 +797,9 @@ fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
     lines.extend(add_section(
         "Actions",
         &[
-            "Enter opens detail modal (c=copy, n=nano, Esc=close)",
+            "Enter opens detail modal (o=open, c=copy, p=path, s=snip, n=nano, Esc=close)",
             "F8 open hit in $EDITOR; y copy path/content",
+            "/ detail-find within messages; n/N cycle matches",
             "F1 toggle this help; Esc/F10 quit (or back from detail)",
         ],
     ));
@@ -681,7 +907,10 @@ fn render_parsed_content(
     if let Some(ts) = detail.convo.started_at {
         lines.push(Line::from(vec![
             Span::styled("🕐 Started: ", Style::default().fg(palette.hint)),
-            Span::styled(format_relative_time(ts), Style::default().fg(palette.fg)),
+            Span::styled(
+                format_absolute_time(ts),
+                Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+            ),
         ]));
         lines.push(Line::from(""));
     }
@@ -705,7 +934,7 @@ fn render_parsed_content(
         // Role header with timestamp
         let ts_text = msg
             .created_at
-            .map(|t| format!(" · {}", format_relative_time(t)))
+            .map(|t| format!(" · {}", format_absolute_time(t)))
             .unwrap_or_default();
         lines.push(Line::from(vec![
             Span::styled(format!("{} ", role_icon), Style::default()),
@@ -909,7 +1138,7 @@ fn render_detail_modal(
 
     // Build title with scroll position and hints
     let title_text = format!(
-        " {} · line {}/{} · Esc close · c copy · n nano ",
+        " {} · line {}/{} · Esc · o open · c copy · p path · s snip · n nano ",
         hit.title, display_line, total_lines
     );
 
@@ -946,18 +1175,42 @@ fn render_detail_modal(
 ///
 /// Total: ~9 lines overhead.
 /// Results area is 70% of remaining height.
-/// Each item is ~2 lines (title + snippet).
-fn calculate_pane_limit(terminal_height: u16) -> usize {
+/// Lines per item depends on density mode (Compact=2, Cozy=4, Spacious=6).
+fn calculate_pane_limit(terminal_height: u16, density: DensityMode) -> usize {
     const OVERHEAD: u16 = 9;
     const RESULTS_PERCENT: f32 = 0.70;
-    const LINES_PER_ITEM: usize = 2;
-    const MIN_ITEMS: usize = 4;
-    const MAX_ITEMS: usize = 50;
+    const MIN_ITEMS: usize = 3;
+    const MAX_ITEMS: usize = 30;
 
+    let lines_per_item = density.lines_per_item();
     let available = terminal_height.saturating_sub(OVERHEAD);
     let results_height = (available as f32 * RESULTS_PERCENT) as usize;
-    let items = results_height / LINES_PER_ITEM;
+    let items = results_height / lines_per_item;
     items.clamp(MIN_ITEMS, MAX_ITEMS)
+}
+
+/// Return a filtered view of results using the pane-local filter (case-insensitive).
+fn apply_pane_filter(results: &[SearchHit], pane_filter: Option<&str>) -> Vec<SearchHit> {
+    if let Some(filter) = pane_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        let needle = filter.to_lowercase();
+        results
+            .iter()
+            .filter(|h| {
+                let haystacks = [
+                    h.title.as_str(),
+                    h.content.as_str(),
+                    h.workspace.as_str(),
+                    h.source_path.as_str(),
+                ];
+                haystacks
+                    .iter()
+                    .any(|part| part.to_lowercase().contains(&needle))
+            })
+            .cloned()
+            .collect()
+    } else {
+        results.to_vec()
+    }
 }
 
 fn build_agent_panes(results: &[SearchHit], per_pane_limit: usize) -> Vec<AgentPane> {
@@ -985,6 +1238,52 @@ fn build_agent_panes(results: &[SearchHit], per_pane_limit: usize) -> Vec<AgentP
             });
         }
     }
+    panes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_panes_with_filter(
+    results: &[SearchHit],
+    pane_filter: Option<&str>,
+    per_pane_limit: usize,
+    active_pane: &mut usize,
+    pane_scroll_offset: &mut usize,
+    prev_agent: Option<String>,
+    prev_path: Option<String>,
+    max_visible_panes: usize,
+) -> Vec<AgentPane> {
+    let filtered = apply_pane_filter(results, pane_filter);
+    let mut panes = build_agent_panes(&filtered, per_pane_limit);
+
+    if !panes.is_empty() {
+        if let Some(agent) = prev_agent {
+            if let Some(idx) = panes.iter().position(|p| p.agent == agent) {
+                *active_pane = idx;
+                if let Some(path) = prev_path
+                    && let Some(hit_idx) =
+                        panes[idx].hits.iter().position(|h| h.source_path == path)
+                {
+                    panes[idx].selected = hit_idx;
+                }
+            } else {
+                *active_pane = 0;
+            }
+        } else if *active_pane >= panes.len() {
+            *active_pane = panes.len().saturating_sub(1);
+        }
+    } else {
+        *active_pane = 0;
+    }
+
+    if *active_pane < *pane_scroll_offset {
+        *pane_scroll_offset = *active_pane;
+    } else if *active_pane >= *pane_scroll_offset + max_visible_panes {
+        *pane_scroll_offset = active_pane.saturating_sub(max_visible_panes - 1);
+    }
+    if *pane_scroll_offset > panes.len().saturating_sub(1) {
+        *pane_scroll_offset = 0;
+    }
+
     panes
 }
 
@@ -1085,9 +1384,228 @@ fn contextual_snippet(text: &str, query: &str, window: ContextWindow) -> String 
     format!("{prefix}{slice}{suffix}")
 }
 
+/// Smart word wrap for display lines (sux.6.6d).
+/// Wraps at word boundaries with continuation indent.
+/// Returns wrapped lines with 2-space initial indent and 4-space continuation indent.
+fn smart_word_wrap(text: &str, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let initial_indent = "  ";
+    let continuation_indent = "    ";
+
+    // Available width after indent
+    let first_line_width = max_width.saturating_sub(initial_indent.len());
+    let cont_line_width = max_width.saturating_sub(continuation_indent.len());
+
+    if text.is_empty() || first_line_width == 0 {
+        return lines;
+    }
+
+    // Split into words
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return lines;
+    }
+
+    let mut current_line = String::new();
+    let mut is_first_line = true;
+
+    for word in words {
+        let word_len = word.chars().count();
+        let current_len = current_line.chars().count();
+        let available = if is_first_line {
+            first_line_width
+        } else {
+            cont_line_width
+        };
+
+        if current_len == 0 {
+            // First word on line
+            if word_len > available {
+                // Word too long - truncate it
+                let truncated: String = word.chars().take(available.saturating_sub(1)).collect();
+                current_line = format!("{}…", truncated);
+            } else {
+                current_line = word.to_string();
+            }
+        } else if current_len + 1 + word_len <= available {
+            // Word fits
+            current_line.push(' ');
+            current_line.push_str(word);
+        } else {
+            // Word doesn't fit - wrap
+            let indent = if is_first_line {
+                initial_indent
+            } else {
+                continuation_indent
+            };
+            lines.push(format!("{}{}", indent, current_line));
+            is_first_line = false;
+
+            // Start new line with word
+            if word_len > cont_line_width {
+                let truncated: String = word
+                    .chars()
+                    .take(cont_line_width.saturating_sub(1))
+                    .collect();
+                current_line = format!("{}…", truncated);
+            } else {
+                current_line = word.to_string();
+            }
+        }
+    }
+
+    // Don't forget the last line
+    if !current_line.is_empty() {
+        let indent = if is_first_line {
+            initial_indent
+        } else {
+            continuation_indent
+        };
+        lines.push(format!("{}{}", indent, current_line));
+    }
+
+    lines
+}
+
+/// Count query term occurrences in text (case-insensitive).
+/// For multi-word queries, counts each term separately and sums.
+/// Used for sux.6.6c match count display.
+fn count_query_matches(text: &str, query: &str) -> usize {
+    if query.is_empty() || text.is_empty() {
+        return 0;
+    }
+    let text_lower = text.to_lowercase();
+    let query_lower = query.to_lowercase();
+
+    // First try exact phrase match count
+    let phrase_count = text_lower.matches(&query_lower).count();
+    if phrase_count > 0 {
+        return phrase_count;
+    }
+
+    // Fall back to counting individual terms
+    query_lower
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .map(|term| text_lower.matches(term).count())
+        .sum()
+}
+
+/// Convert a ratatui Line into plain text for search/highlight helpers.
+fn line_plain_text(line: &Line) -> String {
+    line.spans
+        .iter()
+        .map(|s| s.content.clone().into_owned())
+        .collect()
+}
+
+/// Return zero-based line numbers that contain `needle` (case-insensitive).
+fn match_line_indices(lines: &[Line], needle: &str) -> Vec<u16> {
+    if needle.trim().is_empty() {
+        return Vec::new();
+    }
+    let needle_lc = needle.to_lowercase();
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let text = line_plain_text(line).to_lowercase();
+            if text.contains(&needle_lc) {
+                Some(idx.min(u16::MAX as usize) as u16)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+struct SyntaxAssets {
+    ps: SyntaxSet,
+    theme_dark: Theme,
+    theme_light: Theme,
+}
+
+static SYNTAX: OnceCell<Option<SyntaxAssets>> = OnceCell::new();
+
+fn syntax_assets() -> Option<&'static SyntaxAssets> {
+    SYNTAX
+        .get_or_init(|| {
+            let ps = SyntaxSet::load_defaults_newlines();
+            let ts = ThemeSet::load_defaults();
+            let theme_dark = ts
+                .themes
+                .get("base16-ocean.dark")
+                .or_else(|| ts.themes.values().next())
+                .cloned();
+            let theme_light = ts
+                .themes
+                .get("base16-ocean.light")
+                .or_else(|| ts.themes.values().next())
+                .cloned();
+            match (theme_dark, theme_light) {
+                (Some(d), Some(l)) => Some(SyntaxAssets {
+                    ps,
+                    theme_dark: d,
+                    theme_light: l,
+                }),
+                _ => None,
+            }
+        })
+        .as_ref()
+}
+
+fn syntect_color_to_ratatui(c: syntect::highlighting::Color) -> Color {
+    Color::Rgb(c.r, c.g, c.b)
+}
+
+fn syntax_highlight_line(
+    line: &str,
+    path_hint: &str,
+    highlight_term: &str,
+    palette: ThemePalette,
+    theme_dark: bool,
+) -> Option<Line<'static>> {
+    if line.is_empty() || line.chars().count() > 400 {
+        return None;
+    }
+    let assets = syntax_assets()?;
+    let syntax = assets
+        .ps
+        .find_syntax_for_file(path_hint)
+        .ok()
+        .flatten()
+        .or_else(|| assets.ps.find_syntax_by_extension("rs"))
+        .unwrap_or_else(|| assets.ps.find_syntax_plain_text());
+    let theme = if theme_dark {
+        &assets.theme_dark
+    } else {
+        &assets.theme_light
+    };
+    let mut h = HighlightLines::new(syntax, theme);
+    let ranges = h.highlight_line(line, &assets.ps).ok()?;
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (style, text) in ranges {
+        let base = Style::default().fg(syntect_color_to_ratatui(style.foreground));
+        spans.extend(highlight_spans_owned(text, highlight_term, palette, base));
+    }
+    Some(Line::from(spans))
+}
+
 fn state_path_for(data_dir: &std::path::Path) -> std::path::PathBuf {
     // Persist lightweight, non-secret UI preferences (match mode, context window).
     data_dir.join("tui_state.json")
+}
+
+fn ranking_from_str(s: &str) -> RankingMode {
+    match s {
+        "recent" => RankingMode::RecentHeavy,
+        "relevance" => RankingMode::RelevanceHeavy,
+        "quality" => RankingMode::MatchQualityHeavy,
+        "newest" => RankingMode::DateNewest,
+        "oldest" => RankingMode::DateOldest,
+        _ => RankingMode::Balanced,
+    }
 }
 
 fn chips_for_filters(filters: &SearchFilters, palette: ThemePalette) -> Vec<Span<'static>> {
@@ -1132,6 +1650,114 @@ fn chips_for_filters(filters: &SearchFilters, palette: ThemePalette) -> Vec<Span
     spans
 }
 
+fn contextual_shortcuts(
+    palette_open: bool,
+    show_detail_modal: bool,
+    input_mode: InputMode,
+    focus_region: FocusRegion,
+) -> Vec<(String, String)> {
+    if palette_open {
+        return vec![
+            ("Esc".into(), "Close".into()),
+            ("↑/↓".into(), "Select".into()),
+            ("Enter".into(), "Run".into()),
+        ];
+    }
+    if show_detail_modal {
+        return vec![
+            ("Esc".into(), "Close detail".into()),
+            ("j/k".into(), "Scroll".into()),
+            ("Home/End".into(), "Top/Bottom".into()),
+            ("c".into(), "Copy".into()),
+        ];
+    }
+    match input_mode {
+        InputMode::Agent => vec![
+            ("type".into(), "Agent filter".into()),
+            ("Enter".into(), "Apply".into()),
+            ("Esc".into(), "Cancel".into()),
+        ],
+        InputMode::Workspace => vec![
+            ("type".into(), "Workspace filter".into()),
+            ("Enter".into(), "Apply".into()),
+            ("Esc".into(), "Cancel".into()),
+        ],
+        InputMode::PaneFilter => vec![
+            ("type".into(), "Pane filter".into()),
+            ("Enter".into(), "Apply".into()),
+            ("Esc".into(), "Clear".into()),
+        ],
+        InputMode::CreatedFrom | InputMode::CreatedTo => vec![
+            ("type".into(), "Date (YYYY-MM-DD)".into()),
+            ("Enter".into(), "Apply".into()),
+            ("Esc".into(), "Cancel".into()),
+        ],
+        InputMode::DetailFind => vec![
+            ("type".into(), "Find term".into()),
+            ("Enter".into(), "Apply".into()),
+            ("Esc".into(), "Cancel".into()),
+        ],
+        InputMode::Query => match focus_region {
+            FocusRegion::Results => vec![
+                ("Ctrl+P".into(), "Palette".into()),
+                ("Enter".into(), "Open detail".into()),
+                ("m".into(), "Select".into()),
+                ("A".into(), "Bulk menu".into()),
+                ("/".into(), "Pane filter".into()),
+                ("F3/F4/F5".into(), "Filters".into()),
+                ("Esc".into(), "Quit/back".into()),
+            ],
+            FocusRegion::Detail => vec![
+                ("Tab".into(), "Focus results".into()),
+                ("←/→".into(), "Tabs".into()),
+                ("/".into(), "Find in detail".into()),
+                ("n/N".into(), "Next/prev match".into()),
+                ("c".into(), "Copy".into()),
+                ("o".into(), "Open file".into()),
+                ("Esc".into(), "Close detail".into()),
+            ],
+        },
+    }
+}
+
+fn save_view_slot(
+    slot: u8,
+    filters: &SearchFilters,
+    ranking: RankingMode,
+    saved_views: &mut Vec<SavedView>,
+) -> String {
+    if !(1..=9).contains(&slot) {
+        return "Invalid slot".into();
+    }
+    saved_views.retain(|v| v.slot != slot);
+    saved_views.push(SavedView {
+        slot,
+        agents: filters.agents.clone(),
+        workspaces: filters.workspaces.clone(),
+        created_from: filters.created_from,
+        created_to: filters.created_to,
+        ranking,
+    });
+    saved_views.sort_by_key(|v| v.slot);
+    format!("Saved view to slot {}", slot)
+}
+
+fn load_view_slot(
+    slot: u8,
+    filters: &mut SearchFilters,
+    ranking: &mut RankingMode,
+    saved_views: &[SavedView],
+) -> Option<String> {
+    saved_views.iter().find(|v| v.slot == slot).map(|v| {
+        filters.agents = v.agents.clone();
+        filters.workspaces = v.workspaces.clone();
+        filters.created_from = v.created_from;
+        filters.created_to = v.created_to;
+        *ranking = v.ranking;
+        format!("Loaded view slot {}", slot)
+    })
+}
+
 fn load_state(path: &std::path::Path) -> TuiStatePersisted {
     std::fs::read_to_string(path)
         .ok()
@@ -1143,6 +1769,93 @@ fn save_state(path: &std::path::Path, state: &TuiStatePersisted) {
     if let Ok(body) = serde_json::to_string_pretty(state) {
         let _ = std::fs::write(path, body);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BreadcrumbKind {
+    Agent,
+    Workspace,
+    Date,
+    Ranking,
+}
+
+fn ranking_label(r: RankingMode) -> &'static str {
+    match r {
+        RankingMode::RecentHeavy => "Recent",
+        RankingMode::Balanced => "Balanced",
+        RankingMode::RelevanceHeavy => "Relevance",
+        RankingMode::MatchQualityHeavy => "Quality",
+        RankingMode::DateNewest => "Newest",
+        RankingMode::DateOldest => "Oldest",
+    }
+}
+
+fn breadcrumb_spans(
+    filters: &SearchFilters,
+    ranking: RankingMode,
+    palette: ThemePalette,
+) -> Vec<(BreadcrumbKind, Span<'static>)> {
+    let agent = if filters.agents.is_empty() {
+        "All agents".to_string()
+    } else {
+        filters.agents.iter().cloned().collect::<Vec<_>>().join(",")
+    };
+    let workspace = if filters.workspaces.is_empty() {
+        "All workspaces".to_string()
+    } else {
+        filters
+            .workspaces
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let date = match (filters.created_from, filters.created_to) {
+        (None, None) => "Any time".to_string(),
+        (Some(f), None) => format!("From {}", format_time_short(f)),
+        (None, Some(t)) => format!("To {}", format_time_short(t)),
+        (Some(f), Some(t)) => format!("{} → {}", format_time_short(f), format_time_short(t)),
+    };
+    let rank = ranking_label(ranking).to_string();
+
+    vec![
+        (
+            BreadcrumbKind::Agent,
+            Span::styled(agent, Style::default().fg(palette.fg)),
+        ),
+        (
+            BreadcrumbKind::Workspace,
+            Span::styled(workspace, Style::default().fg(palette.fg)),
+        ),
+        (
+            BreadcrumbKind::Date,
+            Span::styled(date, Style::default().fg(palette.fg)),
+        ),
+        (
+            BreadcrumbKind::Ranking,
+            Span::styled(rank, Style::default().fg(palette.accent)),
+        ),
+    ]
+}
+
+fn render_breadcrumbs(
+    f: &mut Frame<'_>,
+    area: Rect,
+    crumbs: &[(BreadcrumbKind, Span<'static>)],
+    palette: ThemePalette,
+) -> Vec<(Rect, BreadcrumbKind)> {
+    let mut spans: Vec<Span> = Vec::new();
+    for (idx, (_kind, span)) in crumbs.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" | ", Style::default().fg(palette.hint)));
+        }
+        spans.push(span.clone());
+    }
+    let para = Paragraph::new(Line::from(spans))
+        .block(Block::default().style(Style::default().fg(palette.hint)));
+    f.render_widget(para, area);
+    // For now, return the whole area tagged as a generic breadcrumb; mouse hit detection not used.
+    crumbs.iter().map(|(kind, _)| (area, *kind)).collect()
 }
 
 /// Save a query to the history, avoiding duplicates and limiting size.
@@ -1221,11 +1934,7 @@ fn highlight_spans_owned(
             let end = pos + query.len();
             spans.push(Span::styled(
                 remaining[pos..end].to_string(),
-                base.patch(
-                    Style::default()
-                        .fg(palette.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                base.patch(palette.highlight_style()),
             ));
             remaining = &remaining[end..];
         }
@@ -1243,11 +1952,7 @@ fn highlight_spans_owned(
         let end = start + q.len();
         spans.push(Span::styled(
             text[start..end].to_string(),
-            base.patch(
-                Style::default()
-                    .fg(palette.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            base.patch(palette.highlight_style()),
         ));
         idx = end;
     }
@@ -1465,16 +2170,48 @@ fn parse_time_input(input: &str) -> Option<i64> {
     None
 }
 
+fn quick_date_range_today() -> Option<(i64, i64)> {
+    use chrono::{Datelike, Local, TimeZone};
+    let now = Local::now();
+    let start = Local
+        .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
+        .single()?;
+    Some((start.timestamp_millis(), now.timestamp_millis()))
+}
+
+fn quick_date_range_week() -> Option<(i64, i64)> {
+    use chrono::{Duration, Local};
+    let now = Local::now();
+    let week_ago = now - Duration::days(7);
+    Some((week_ago.timestamp_millis(), now.timestamp_millis()))
+}
+
+fn quick_date_range_hours(hours: i64) -> Option<(i64, i64)> {
+    use chrono::{Duration, Local};
+    let now = Local::now();
+    let since = now - Duration::hours(hours);
+    Some((since.timestamp_millis(), now.timestamp_millis()))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusRegion {
     Results,
     Detail,
 }
 
+#[derive(Clone, Debug, Default)]
+struct DetailFindState {
+    query: String,
+    matches: Vec<u16>,
+    current: usize,
+}
+
+#[allow(dead_code)]
 fn char_width(s: &str) -> usize {
     s.chars().count()
 }
 
+#[allow(dead_code)]
 /// Build a dense shortcut legend that fits within `max_width` characters.
 fn footer_shortcuts(max_width: usize) -> String {
     const SHORTCUTS: &[&str] = &[
@@ -1484,6 +2221,7 @@ fn footer_shortcuts(max_width: usize) -> String {
         "/ query",
         "[ ] tabs",
         "Space peek",
+        "m select",
         "y copy",
         "F3 agent",
         "F4 ws",
@@ -1574,17 +2312,37 @@ pub fn run_tui(
     let mut input_mode = InputMode::Query;
     let mut input_buffer = String::new();
     let page_size: usize = 120;
-    // Calculate initial pane limit based on terminal height
+    // Load density mode from persisted state (case-insensitive)
+    let mut density_mode = match persisted
+        .density_mode
+        .as_deref()
+        .map(|s| s.to_lowercase())
+        .as_deref()
+    {
+        Some("compact") => DensityMode::Compact,
+        Some("spacious") => DensityMode::Spacious,
+        _ => DensityMode::Cozy, // Default
+    };
+    // Calculate initial pane limit based on terminal height and density
     let initial_height = terminal.size().map(|r| r.height).unwrap_or(24);
-    let mut per_pane_limit: usize = calculate_pane_limit(initial_height);
+    let mut per_pane_limit: usize = calculate_pane_limit(initial_height, density_mode);
     let mut last_terminal_height: u16 = initial_height;
     let mut page: usize = 0;
     let mut results: Vec<SearchHit> = Vec::new();
     let mut wildcard_fallback: bool = false; // True when search used implicit wildcards
+    let mut suggestions: Vec<QuerySuggestion> = Vec::new(); // Did-you-mean suggestions for zero hits
+    let cache_debug = std::env::var("CASS_DEBUG_CACHE_METRICS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut cache_stats: Option<CacheStats> = None;
+    let mut last_search_ms: Option<u128> = None;
     let mut panes: Vec<AgentPane> = Vec::new();
+    let mut pane_filter: Option<String> = None;
     let mut active_pane: usize = 0;
     const MAX_VISIBLE_PANES: usize = 4;
     let mut pane_scroll_offset: usize = 0; // First visible pane index
+    // Multi-select state: (pane_index, hit_index) tuples of selected items
+    let mut selected: HashSet<(usize, usize)> = HashSet::new();
     let mut focus_region = FocusRegion::Results;
     let mut detail_scroll: u16 = 0;
     let mut focus_flash_until: Option<Instant> = None;
@@ -1604,7 +2362,11 @@ pub fn run_tui(
     // Full-screen modal for viewing parsed content
     let mut show_detail_modal = false;
     let mut modal_scroll: u16 = 0;
+    // Bulk action modal state
+    let mut show_bulk_modal = false;
+    let mut bulk_action_idx: usize = 0;
     let mut cached_detail: Option<(String, ConversationView)> = None;
+    let mut detail_find: Option<DetailFindState> = None;
     let mut last_query = String::new();
     let mut needs_draw = true;
     // Load query history from persisted state, or start fresh
@@ -1620,6 +2382,35 @@ pub fn run_tui(
         _ => MatchMode::Prefix,
     };
     let mut ranking_mode = RankingMode::Balanced;
+    let mut saved_views: Vec<SavedView> = persisted
+        .saved_views
+        .as_ref()
+        .map(|v| {
+            v.iter()
+                .filter_map(|sv| {
+                    if (1..=9).contains(&sv.slot) {
+                        Some(SavedView {
+                            slot: sv.slot,
+                            agents: sv.agents.iter().cloned().collect(),
+                            workspaces: sv.workspaces.iter().cloned().collect(),
+                            created_from: sv.created_from,
+                            created_to: sv.created_to,
+                            ranking: sv
+                                .ranking
+                                .as_deref()
+                                .map(ranking_from_str)
+                                .unwrap_or(RankingMode::Balanced),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut help_pinned = persisted.help_pinned.unwrap_or(false);
+    let mut help_last_interaction = Instant::now();
+    let mut fancy_borders = true; // Toggle with Ctrl+B for unicode vs ASCII borders
     let mut context_window = match persisted.context_window.as_deref() {
         Some("S") => ContextWindow::Small,
         Some("M") => ContextWindow::Medium,
@@ -1632,10 +2423,16 @@ pub fn run_tui(
     let mut help_scroll: u16 = 0;
     let editor_cmd = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
     let editor_line_flag = std::env::var("EDITOR_LINE_FLAG").unwrap_or_else(|_| "+".into());
+    let mut time_preset_idx: usize = 0;
 
     // Mouse support: track layout regions for click/scroll handling
     let mut last_detail_area: Option<Rect> = None;
     let mut last_pane_rects: Vec<Rect> = Vec::new();
+    let mut last_pill_rects: Vec<(Rect, Pill)> = Vec::new();
+    let mut last_breadcrumb_rects: Vec<(Rect, BreadcrumbKind)> = Vec::new();
+
+    // Command palette + help strip + pills state
+    let mut palette_state = PaletteState::new(palette::default_actions());
 
     // Helper to get indexing phase info (returns phase, current, total, is_rebuild, pct)
     let get_indexing_state = |progress: &std::sync::Arc<crate::indexer::IndexingProgress>| -> (usize, usize, usize, bool, usize) {
@@ -1666,7 +2463,15 @@ pub fn run_tui(
             _ => ("⏳", "Processing"),
         };
 
-        let mut s = format!(" | {} {} {}/{} ({}%)", icon, phase_str, current, total, pct);
+        let bar_width = 8;
+        let filled = ((pct * bar_width).saturating_add(99)) / 100; // round up a bit
+        let empty = bar_width.saturating_sub(filled.min(bar_width));
+        let bar = format!("{}{}", "█".repeat(filled.min(bar_width)), "░".repeat(empty));
+
+        let mut s = format!(
+            " | {} {} {}/{} ({}%) {}",
+            icon, phase_str, current, total, pct, bar
+        );
         if is_rebuild {
             s.push_str(" ⚠ FULL REBUILD - Search unavailable");
         } else if phase > 0 {
@@ -1681,10 +2486,23 @@ pub fn run_tui(
             && size.height != last_terminal_height
         {
             last_terminal_height = size.height;
-            let new_limit = calculate_pane_limit(size.height);
+            let new_limit = calculate_pane_limit(size.height, density_mode);
             if new_limit != per_pane_limit {
                 per_pane_limit = new_limit;
-                panes = build_agent_panes(&results, per_pane_limit);
+                let prev_agent = active_hit(&panes, active_pane)
+                    .map(|h| h.agent.clone())
+                    .or_else(|| panes.get(active_pane).map(|p| p.agent.clone()));
+                let prev_path = active_hit(&panes, active_pane).map(|h| h.source_path.clone());
+                panes = rebuild_panes_with_filter(
+                    &results,
+                    pane_filter.as_deref(),
+                    per_pane_limit,
+                    &mut active_pane,
+                    &mut pane_scroll_offset,
+                    prev_agent,
+                    prev_path,
+                    MAX_VISIBLE_PANES,
+                );
                 needs_draw = true;
             }
         }
@@ -1704,7 +2522,7 @@ pub fn run_tui(
                         [
                             Constraint::Length(3), // search bar (includes filter chips)
                             Constraint::Min(0),    // results + detail
-                            Constraint::Length(1), // footer
+                            Constraint::Length(2), // footer (status + help strip)
                         ]
                         .as_ref(),
                     )
@@ -1716,14 +2534,78 @@ pub fn run_tui(
                     InputMode::Workspace => format!("[workspace] {}", input_buffer),
                     InputMode::CreatedFrom => format!("[from] {}", input_buffer),
                     InputMode::CreatedTo => format!("[to] {}", input_buffer),
+                    InputMode::PaneFilter => format!("[pane] {}", input_buffer),
+                    InputMode::DetailFind => format!("[detail find] {}", input_buffer),
                 };
                 let mode_label = match match_mode {
                     MatchMode::Standard => "standard",
                     MatchMode::Prefix => "prefix",
                 };
+                let search_split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(
+                        [
+                            Constraint::Length(2), // input
+                            Constraint::Length(1), // pills
+                            Constraint::Length(1), // breadcrumbs
+                        ]
+                        .as_ref(),
+                    )
+                    .split(chunks[0]);
+
                 let chips = chips_for_filters(&filters, palette);
                 let sb = search_bar(&bar_text, palette, input_mode, mode_label, chips);
-                f.render_widget(sb, chunks[0]);
+                f.render_widget(sb, search_split[0]);
+
+                let mut pill_vec: Vec<Pill> = Vec::new();
+                if !filters.agents.is_empty() {
+                    pill_vec.push(Pill {
+                        label: "agent".into(),
+                        value: filters.agents.iter().cloned().collect::<Vec<_>>().join("|"),
+                        active: true,
+                        editable: true,
+                    });
+                }
+                if !filters.workspaces.is_empty() {
+                    pill_vec.push(Pill {
+                        label: "ws".into(),
+                        value: filters
+                            .workspaces
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                        active: true,
+                        editable: true,
+                    });
+                }
+                if let Some(filter) = pane_filter.as_ref().filter(|s| !s.is_empty()) {
+                    pill_vec.push(Pill {
+                        label: "pane".into(),
+                        value: filter.clone(),
+                        active: true,
+                        editable: true,
+                    });
+                }
+                if filters.created_from.is_some() || filters.created_to.is_some() {
+                    pill_vec.push(Pill {
+                        label: "time".into(),
+                        value: format_time_chip(filters.created_from, filters.created_to),
+                        active: true,
+                        editable: true,
+                    });
+                }
+                // Render pills and record their rects for click handling
+                let pill_rects = pills::draw_pills(f, search_split[1], &pill_vec, palette);
+                last_pill_rects = pill_rects
+                    .into_iter()
+                    .zip(pill_vec.iter().cloned())
+                    .collect();
+
+                // Breadcrumb/locality bar
+                let crumbs = breadcrumb_spans(&filters, ranking_mode, palette);
+                let bc_rects = render_breadcrumbs(f, search_split[2], &crumbs, palette);
+                last_breadcrumb_rects = bc_rects;
 
                 // Responsive layout: detail pane expands when focused
                 let (results_pct, detail_pct) = match focus_region {
@@ -1743,6 +2625,13 @@ pub fn run_tui(
 
                 let results_area = main_split[0];
                 let detail_area = main_split[1];
+
+                // Border style toggle: unicode rounded vs plain ASCII
+                let border_type = if fancy_borders {
+                    BorderType::Rounded
+                } else {
+                    BorderType::Plain
+                };
 
                 // Save layout for mouse hit testing
                 last_detail_area = Some(detail_area);
@@ -1860,11 +2749,15 @@ pub fn run_tui(
                                 match_mode,
                                 palette,
                                 fuzzy.as_deref(),
+                                &suggestions,
                             ));
                         }
                     }
 
-                    let block = Block::default().title("Results").borders(Borders::ALL);
+                    let block = Block::default()
+                        .title("Results")
+                        .borders(Borders::ALL)
+                        .border_type(border_type);
                     f.render_widget(Paragraph::new(lines).block(block), results_area);
                 } else {
                     // Cap visible panes at MAX_VISIBLE_PANES
@@ -1898,37 +2791,134 @@ pub fn run_tui(
                         let items: Vec<ListItem> = pane
                             .hits
                             .iter()
-                            .map(|hit| {
+                            .enumerate()
+                            .map(|(hit_idx, hit)| {
                                 let title = if hit.title.is_empty() {
                                     "(untitled)"
                                 } else {
                                     hit.title.as_str()
                                 };
-                                // Build header with score bar visualization
-                                let mut header_spans = score_bar(hit.score, palette);
+                                // Build header with agent badge + score bar visualization
+                                let mut header_spans: Vec<Span> = Vec::new();
+                                // Multi-select indicator (✓) at start if selected
+                                let is_selected = selected.contains(&(idx, hit_idx));
+                                if is_selected {
+                                    header_spans.push(Span::styled(
+                                        "✓ ",
+                                        Style::default()
+                                            .fg(Color::Rgb(46, 204, 113)) // Emerald green for selection
+                                            .add_modifier(Modifier::BOLD),
+                                    ));
+                                }
+                                let icon = ThemePalette::agent_icon(&pane.agent);
+                                header_spans.push(Span::styled(
+                                    format!("{icon} "),
+                                    Style::default()
+                                        .fg(theme.accent)
+                                        .add_modifier(Modifier::BOLD),
+                                ));
+                                header_spans.push(Span::styled(
+                                    format!("@{} ", pane.agent),
+                                    Style::default().fg(palette.hint),
+                                ));
+                                header_spans.extend(score_bar(hit.score, palette));
                                 header_spans.push(Span::raw(" "));
                                 header_spans.push(Span::styled(
                                     title.to_string(),
                                     Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
                                 ));
+
+                                // Choose highlight term: prefer pane filter when active.
+                                let highlight_term = pane_filter
+                                    .as_deref()
+                                    .filter(|s| !s.trim().is_empty())
+                                    .unwrap_or(&last_query);
+
+                                // Add match count if > 1 (sux.6.6c)
+                                let match_count = count_query_matches(&hit.content, highlight_term);
+                                if match_count > 1 {
+                                    header_spans.push(Span::styled(
+                                        format!(" (×{})", match_count),
+                                        Style::default().fg(palette.hint),
+                                    ));
+                                }
+
                                 let header = Line::from(header_spans);
-                                // Truncate paths for display (max 40 chars each)
-                                let truncated_source = truncate_path(&hit.source_path, 40);
-                                let location = if hit.workspace.is_empty() {
-                                    truncated_source
-                                } else {
-                                    let truncated_ws = truncate_path(&hit.workspace, 30);
-                                    format!("{} ({})", truncated_source, truncated_ws)
-                                };
-                                let raw_snippet =
-                                    contextual_snippet(&hit.content, &last_query, context_window);
-                                let body_line = highlight_terms_owned_with_style(
-                                    format!("{location} • {raw_snippet}"),
-                                    &last_query,
-                                    palette,
-                                    Style::default().fg(theme.fg),
+
+                                // Location line (separate from snippet for clarity)
+                                let truncated_source = truncate_path(&hit.source_path, 50);
+                                let truncated_ws = truncate_path(&hit.workspace, 30);
+                                let mut location_spans: Vec<Span> = vec![
+                                    Span::styled("[file] ", Style::default().fg(palette.hint)),
+                                    Span::styled(
+                                        truncated_source,
+                                        Style::default().fg(palette.hint),
+                                    ),
+                                ];
+                                if !hit.workspace.is_empty() {
+                                    location_spans.push(Span::raw("  "));
+                                    location_spans.push(Span::styled(
+                                        "[ws] ",
+                                        Style::default().fg(palette.hint),
+                                    ));
+                                    location_spans.push(Span::styled(
+                                        truncated_ws,
+                                        Style::default().fg(palette.hint),
+                                    ));
+                                }
+                                if let Some(ts) = hit.created_at {
+                                    location_spans.push(Span::styled(
+                                        format!(" · {}", format_relative_time(ts)),
+                                        Style::default().fg(palette.hint),
+                                    ));
+                                }
+                                let location_line = Line::from(location_spans);
+
+                                // Snippet with enhanced highlighting (multiple lines if long)
+                                let raw_snippet = contextual_snippet(
+                                    &hit.content,
+                                    highlight_term,
+                                    context_window,
                                 );
-                                ListItem::new(vec![header, body_line])
+
+                                // Smart word wrap for snippet content (sux.6.6d)
+                                // Wrap at word boundaries with continuation indent
+                                // Limit to 2 lines for compact display (sux.6.1)
+                                let wrapped_lines = smart_word_wrap(&raw_snippet, 80);
+                                let snippet_lines: Vec<Line> =
+                                    wrapped_lines
+                                        .into_iter()
+                                        .take(2)
+                                        .map(|line| {
+                                            syntax_highlight_line(
+                                                &line,
+                                                &hit.source_path,
+                                                highlight_term,
+                                                palette,
+                                                theme_dark,
+                                            )
+                                            .unwrap_or_else(|| {
+                                                highlight_terms_owned_with_style(
+                                                    line,
+                                                    highlight_term,
+                                                    palette,
+                                                    Style::default().fg(theme.fg),
+                                                )
+                                            })
+                                        })
+                                        .collect();
+
+                                // Alternating background for better visual separation (sux.6.3)
+                                let stripe_bg = if hit_idx % 2 == 0 {
+                                    palette.stripe_even
+                                } else {
+                                    palette.stripe_odd
+                                };
+
+                                let mut lines = vec![header, location_line];
+                                lines.extend(snippet_lines);
+
+                                ListItem::new(lines).style(Style::default().bg(stripe_bg))
                             })
                             .collect();
 
@@ -1968,6 +2958,7 @@ pub fn run_tui(
                                 ),
                             ))
                             .borders(Borders::ALL)
+                            .border_type(border_type)
                             .border_style(Style::default().fg(if is_focused_pane {
                                 theme.accent
                             } else {
@@ -2045,52 +3036,7 @@ pub fn run_tui(
                 }
 
                 if let Some(hit) = active_hit(&panes, active_pane) {
-                    let tabs = ["Messages", "Snippets", "Raw"];
-                    let tab_titles: Vec<Line> = tabs
-                        .iter()
-                        .map(|t| Line::from(Span::styled(*t, Style::default().fg(palette.hint))))
-                        .collect();
-                    let tab_widget = Tabs::new(tab_titles)
-                        .select(match detail_tab {
-                            DetailTab::Messages => 0,
-                            DetailTab::Snippets => 1,
-                            DetailTab::Raw => 2,
-                        })
-                        .highlight_style(
-                            Style::default()
-                                .fg(palette.accent)
-                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                        )
-                        .divider(" │ ");
-
-                    let mut meta_lines = Vec::new();
-                    let agent_theme = ThemePalette::agent_pane(&hit.agent);
-                    meta_lines.push(Line::from(vec![
-                        Span::styled("Title: ", palette.title()),
-                        Span::raw(hit.title.clone()),
-                    ]));
-                    meta_lines.push(Line::from(vec![
-                        Span::styled("Agent: ", Style::default().fg(agent_theme.accent)),
-                        Span::styled(
-                            agent_display_name(&hit.agent),
-                            Style::default().fg(agent_theme.fg),
-                        ),
-                    ]));
-                    meta_lines.push(Line::from(vec![
-                        Span::styled("Workspace: ", Style::default().fg(palette.hint)),
-                        Span::raw(if hit.workspace.is_empty() {
-                            "(none)".into()
-                        } else {
-                            truncate_path(&hit.workspace, 60)
-                        }),
-                    ]));
-                    meta_lines.push(Line::from(vec![
-                        Span::styled("Source: ", Style::default().fg(palette.hint)),
-                        Span::raw(truncate_path(&hit.source_path, 60)),
-                    ]));
-                    meta_lines.push(Line::from(format!("Score: {:.2}", hit.score)));
-                    meta_lines.push(Line::from(""));
-
+                    // Load detail data first to get counts for tabs
                     let detail = if cached_detail
                         .as_ref()
                         .map(|(p, _)| p == &hit.source_path)
@@ -2105,32 +3051,139 @@ pub fn run_tui(
                         };
                         if let Some(d) = &loaded {
                             cached_detail = Some((hit.source_path.clone(), d.clone()));
-                            // Reset scroll when loading new conversation
                             detail_scroll = 0;
                         }
                         loaded
                     };
-                    let content_para = match detail_tab {
+
+                    // Count messages and snippets for tab labels
+                    let (msg_count, snippet_count) = if let Some(ref d) = detail {
+                        let msgs = d.messages.len();
+                        let snips: usize = d.messages.iter().map(|m| m.snippets.len()).sum();
+                        (msgs, snips)
+                    } else {
+                        (0, 0)
+                    };
+
+                    // Build tab labels with counts (sux.6.5)
+                    let tab_labels = [
+                        format!("Messages ({})", msg_count),
+                        format!("Snippets ({})", snippet_count),
+                        "Raw".to_string(),
+                    ];
+                    let tab_titles: Vec<Line> = tab_labels
+                        .iter()
+                        .map(|t| {
+                            Line::from(Span::styled(t.as_str(), Style::default().fg(palette.hint)))
+                        })
+                        .collect();
+                    let tab_widget = Tabs::new(tab_titles)
+                        .select(match detail_tab {
+                            DetailTab::Messages => 0,
+                            DetailTab::Snippets => 1,
+                            DetailTab::Raw => 2,
+                        })
+                        .highlight_style(
+                            Style::default()
+                                .fg(palette.accent)
+                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                        )
+                        .divider(" │ ");
+
+                    // Build enhanced metadata section (sux.6.5)
+                    let mut meta_lines = Vec::new();
+                    let agent_theme = ThemePalette::agent_pane(&hit.agent);
+                    meta_lines.push(Line::from(vec![
+                        Span::styled("Title: ", palette.title()),
+                        Span::raw(hit.title.clone()),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled("Agent: ", Style::default().fg(agent_theme.accent)),
+                        Span::styled(
+                            agent_display_name(&hit.agent),
+                            Style::default().fg(agent_theme.fg),
+                        ),
+                        Span::raw("  "),
+                        Span::styled("Match: ", Style::default().fg(palette.hint)),
+                        Span::styled(
+                            format!("{:?}", hit.match_type),
+                            Style::default().fg(palette.accent_alt),
+                        ),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled("Workspace: ", Style::default().fg(palette.hint)),
+                        Span::raw(if hit.workspace.is_empty() {
+                            "(none)".into()
+                        } else {
+                            truncate_path(&hit.workspace, 60)
+                        }),
+                    ]));
+                    // Add timestamp info if available
+                    if let Some(ref d) = detail
+                        && let Some(started) = d.convo.started_at
+                    {
+                        let ts = format_absolute_time(started);
+                        meta_lines.push(Line::from(vec![
+                            Span::styled("Created: ", Style::default().fg(palette.hint)),
+                            Span::raw(ts),
+                        ]));
+                    }
+                    meta_lines.push(Line::from(vec![
+                        Span::styled("Source: ", Style::default().fg(palette.hint)),
+                        Span::raw(truncate_path(&hit.source_path, 60)),
+                    ]));
+                    meta_lines.push(Line::from(vec![
+                        Span::styled("Score: ", Style::default().fg(palette.hint)),
+                        Span::raw(format!("{:.2}", hit.score)),
+                        Span::raw("  "),
+                        Span::styled("Stats: ", Style::default().fg(palette.hint)),
+                        Span::raw(format!("{} msgs, {} snippets", msg_count, snippet_count)),
+                    ]));
+
+                    // Determine highlight term priority: detail-find > pane filter > last query
+                    let highlight_term = if let Some(df) = &detail_find {
+                        df.query.as_str()
+                    } else if let Some(pf) = pane_filter.as_deref().filter(|s| !s.trim().is_empty())
+                    {
+                        pf
+                    } else {
+                        last_query.as_str()
+                    };
+
+                    let detail_match_lines: Vec<u16>;
+                    let content_lines: Vec<Line> = match detail_tab {
                         DetailTab::Messages => {
                             if let Some(full) = detail {
-                                let lines = render_parsed_content(&full, &last_query, palette);
+                                let lines = render_parsed_content(&full, highlight_term, palette);
+                                detail_match_lines = match_line_indices(&lines, highlight_term);
                                 if lines.is_empty() {
-                                    Paragraph::new("No messages")
-                                        .style(Style::default().fg(palette.hint))
+                                    vec![Line::from(Span::styled(
+                                        "No messages",
+                                        Style::default().fg(palette.hint),
+                                    ))]
                                 } else {
-                                    Paragraph::new(lines)
-                                        .wrap(Wrap { trim: false })
-                                        .scroll((detail_scroll, 0))
+                                    lines
                                 }
                             } else {
-                                Paragraph::new(hit.content.clone())
-                                    .wrap(Wrap { trim: true })
-                                    .scroll((detail_scroll, 0))
+                                let lines: Vec<Line> = hit
+                                    .content
+                                    .lines()
+                                    .map(|l| Line::from(l.to_string()))
+                                    .collect();
+                                detail_match_lines = match_line_indices(&lines, highlight_term);
+                                if lines.is_empty() {
+                                    vec![Line::from(Span::styled(
+                                        "No messages",
+                                        Style::default().fg(palette.hint),
+                                    ))]
+                                } else {
+                                    lines
+                                }
                             }
                         }
                         DetailTab::Snippets => {
+                            let mut lines = Vec::new();
                             if let Some(full) = detail {
-                                let mut lines = Vec::new();
                                 for (msg_idx, msg) in full.messages.iter().enumerate() {
                                     for snip in &msg.snippets {
                                         let file = snip
@@ -2159,55 +3212,100 @@ pub fn run_tui(
                                         lines.push(Line::from(""));
                                     }
                                 }
-                                if lines.is_empty() {
-                                    Paragraph::new("No snippets attached.")
-                                        .style(Style::default().fg(palette.hint))
-                                } else {
-                                    Paragraph::new(lines)
-                                        .wrap(Wrap { trim: true })
-                                        .scroll((detail_scroll, 0))
-                                }
+                            }
+                            detail_match_lines = match_line_indices(&lines, highlight_term);
+                            if lines.is_empty() {
+                                vec![Line::from(Span::styled(
+                                    "No snippets attached.",
+                                    Style::default().fg(palette.hint),
+                                ))]
                             } else {
-                                Paragraph::new("No snippets loaded")
-                                    .style(Style::default().fg(palette.hint))
+                                lines
                             }
                         }
                         DetailTab::Raw => {
-                            if let Some(full) = detail {
+                            let text = if let Some(full) = detail {
                                 let meta = serde_json::to_string_pretty(&full.convo.metadata_json)
                                     .unwrap_or_else(|_| "<invalid metadata>".into());
-                                let mut text = String::new();
-                                text.push_str(&format!(
+                                let mut t = String::new();
+                                t.push_str(&format!(
                                     "Path: {}\n",
                                     full.convo.source_path.display()
                                 ));
                                 if let Some(ws) = &full.workspace {
-                                    text.push_str(&format!("Workspace: {}\n", ws.path.display()));
+                                    t.push_str(&format!("Workspace: {}\n", ws.path.display()));
                                 }
                                 if let Some(ext) = &full.convo.external_id {
-                                    text.push_str(&format!("External ID: {ext}\n"));
+                                    t.push_str(&format!("External ID: {ext}\n"));
                                 }
-                                text.push_str("Metadata:\n");
-                                text.push_str(&meta);
-                                Paragraph::new(text)
-                                    .wrap(Wrap { trim: true })
-                                    .scroll((detail_scroll, 0))
+                                t.push_str("Metadata:\n");
+                                t.push_str(&meta);
+                                t
                             } else {
-                                Paragraph::new(format!("Path: {}", hit.source_path))
-                                    .wrap(Wrap { trim: true })
-                                    .scroll((detail_scroll, 0))
-                            }
+                                format!("Path: {}", hit.source_path)
+                            };
+                            let lines: Vec<Line> =
+                                text.lines().map(|l| Line::from(l.to_string())).collect();
+                            detail_match_lines = match_line_indices(&lines, highlight_term);
+                            lines
                         }
                     };
 
+                    // Update detail-find state with fresh matches and clamp scroll to content size
+                    if let Some(df) = detail_find.as_mut() {
+                        df.matches = detail_match_lines.clone();
+                        if df.matches.is_empty() {
+                            df.current = 0;
+                        } else {
+                            if df.current >= df.matches.len() {
+                                df.current = 0;
+                            }
+                            if let Some(&line) = df.matches.get(df.current) {
+                                let max_line = content_lines.len().saturating_sub(1) as u16;
+                                detail_scroll = line.min(max_line);
+                            }
+                        }
+                    }
+
+                    let content_para = {
+                        let trim = !matches!(detail_tab, DetailTab::Messages);
+                        Paragraph::new(content_lines)
+                            .wrap(Wrap { trim })
+                            .scroll((detail_scroll, 0))
+                    };
+
                     let is_focused_detail = matches!(focus_region, FocusRegion::Detail);
-                    // Build detail block title with scroll indicator and tab hints
+                    // Build detail block title with scroll indicator, tab hints and quick actions (sux.6.5)
+                    let match_badge = detail_find.as_ref().map(|df| {
+                        if df.query.trim().is_empty() {
+                            String::new()
+                        } else if df.matches.is_empty() {
+                            format!(" • 0/0 \"{}\"", df.query)
+                        } else {
+                            format!(
+                                " • {}/{} \"{}\"",
+                                df.current + 1,
+                                df.matches.len(),
+                                df.query
+                            )
+                        }
+                    });
                     let detail_title = if detail_scroll > 0 {
-                        format!("Detail ↓{} • [ ] tabs", detail_scroll)
+                        format!(
+                            "Detail ↓{} • [←/→] tabs • c=copy o=open{}",
+                            detail_scroll,
+                            match_badge.as_deref().unwrap_or("")
+                        )
                     } else if is_focused_detail {
-                        "Detail • [ ] tabs • j/k scroll".to_string()
+                        format!(
+                            "Detail • [←/→] tabs • j/k scroll • c=copy o=open e=edit{}",
+                            match_badge.as_deref().unwrap_or("")
+                        )
                     } else {
-                        "Detail • [ ] tabs".to_string()
+                        format!(
+                            "Detail • [←/→] tabs • c=copy o=open{}",
+                            match_badge.as_deref().unwrap_or("")
+                        )
                     };
                     let block = Block::default()
                         .title(Span::styled(
@@ -2219,6 +3317,7 @@ pub fn run_tui(
                             }),
                         ))
                         .borders(Borders::ALL)
+                        .border_type(border_type)
                         .border_style(Style::default().fg(if is_focused_detail {
                             palette.accent
                         } else {
@@ -2242,8 +3341,12 @@ pub fn run_tui(
                     f.render_widget(content_para.block(block), layout[2]);
                 } else {
                     f.render_widget(
-                        Paragraph::new("Select a result to view details")
-                            .block(Block::default().title("Detail").borders(Borders::ALL)),
+                        Paragraph::new("Select a result to view details").block(
+                            Block::default()
+                                .title("Detail")
+                                .borders(Borders::ALL)
+                                .border_type(border_type),
+                        ),
                         detail_area,
                     );
                 }
@@ -2264,16 +3367,54 @@ pub fn run_tui(
                     }
                 }
 
+                if let Some(ms) = last_search_ms {
+                    footer_parts.push(format!("⚡ {}ms", ms));
+                }
+
+                if cache_debug {
+                    if let Some(cs) = &cache_stats {
+                        footer_parts.push(format!(
+                            "cache H:{} M:{} SF:{} | reloads {} ({}ms) | cost {}/{}",
+                            cs.cache_hits,
+                            cs.cache_miss,
+                            cs.cache_shortfall,
+                            cs.reloads,
+                            cs.reload_ms_total,
+                            cs.total_cost,
+                            cs.total_cap
+                        ));
+                    } else {
+                        footer_parts.push("cache dbg: pending".to_string());
+                    }
+                }
+
                 if matches!(match_mode, MatchMode::Standard) {
                     footer_parts.push("mode:standard".to_string());
                 }
                 match ranking_mode {
                     RankingMode::RecentHeavy => footer_parts.push("rank:recent".to_string()),
                     RankingMode::RelevanceHeavy => footer_parts.push("rank:relevance".to_string()),
+                    RankingMode::MatchQualityHeavy => footer_parts.push("rank:quality".to_string()),
+                    RankingMode::DateNewest => footer_parts.push("rank:newest".to_string()),
+                    RankingMode::DateOldest => footer_parts.push("rank:oldest".to_string()),
                     RankingMode::Balanced => {}
                 }
                 if wildcard_fallback {
                     footer_parts.push("✱ fuzzy".to_string());
+                }
+                if let Some(f) = pane_filter.as_deref().filter(|s| !s.is_empty()) {
+                    let trimmed = if f.chars().count() > 20 {
+                        let mut s = f.chars().take(20).collect::<String>();
+                        s.push('…');
+                        s
+                    } else {
+                        f.to_string()
+                    };
+                    footer_parts.push(format!("pane:{trimmed}"));
+                }
+                // Show selection count when items are selected
+                if !selected.is_empty() {
+                    footer_parts.push(format!("✓ {} selected", selected.len()));
                 }
                 if !matches!(context_window, ContextWindow::Medium) {
                     footer_parts.push(
@@ -2293,22 +3434,36 @@ pub fn run_tui(
                     footer_parts.push("PEEK".to_string());
                 }
 
-                let mut footer_line = footer_parts.join(" | ");
-                let footer_width = chunks[2].width as usize;
-                let reserved =
-                    char_width(&footer_line) + if footer_line.is_empty() { 0 } else { 3 };
-                if footer_width > reserved {
-                    let shortcuts = footer_shortcuts(footer_width.saturating_sub(reserved));
-                    if !shortcuts.is_empty() {
-                        if !footer_line.is_empty() {
-                            footer_line.push_str(" | ");
-                        }
-                        footer_line.push_str(&shortcuts);
-                    }
-                }
+                let footer_area = chunks[2];
+                let footer_split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
+                    .split(footer_area);
 
+                let footer_line = footer_parts.join(" | ");
                 let footer = Paragraph::new(footer_line);
-                f.render_widget(footer, chunks[2]);
+                f.render_widget(footer, footer_split[0]);
+
+                let shortcuts = contextual_shortcuts(
+                    palette_state.open,
+                    show_detail_modal,
+                    input_mode,
+                    focus_region,
+                );
+                let help_active =
+                    help_pinned || help_last_interaction.elapsed() < Duration::from_secs(8);
+                if help_active {
+                    help_strip::draw_help_strip(
+                        f,
+                        footer_split[1],
+                        &shortcuts,
+                        palette,
+                        help_pinned,
+                    );
+                } else {
+                    // Clear help line when hidden
+                    f.render_widget(Paragraph::new(""), footer_split[1]);
+                }
 
                 if show_help {
                     render_help_overlay(f, palette, help_scroll);
@@ -2320,7 +3475,64 @@ pub fn run_tui(
                     && let Some(pane) = panes.get(active_pane)
                     && let Some(hit) = pane.hits.get(pane.selected)
                 {
-                    render_detail_modal(f, detail, hit, &last_query, palette, modal_scroll);
+                    let modal_highlight = if let Some(df) = &detail_find {
+                        df.query.as_str()
+                    } else if let Some(pf) = pane_filter.as_deref().filter(|s| !s.trim().is_empty())
+                    {
+                        pf
+                    } else {
+                        last_query.as_str()
+                    };
+                    render_detail_modal(f, detail, hit, modal_highlight, palette, modal_scroll);
+                }
+
+                // Bulk action modal
+                if show_bulk_modal {
+                    let area = centered_rect(50, 30, f.area());
+                    let block = Block::default()
+                        .title(Span::styled(
+                            format!(" Bulk Actions ({} selected) ", selected.len()),
+                            Style::default()
+                                .fg(palette.accent)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(palette.accent))
+                        .style(Style::default().bg(palette.surface));
+
+                    const BULK_ACTIONS: [&str; 4] = [
+                        "Open all in editor",
+                        "Copy all paths",
+                        "Export as JSON",
+                        "Clear selection",
+                    ];
+                    let items: Vec<ListItem> = BULK_ACTIONS
+                        .iter()
+                        .enumerate()
+                        .map(|(i, label)| {
+                            let style = if i == bulk_action_idx {
+                                Style::default()
+                                    .bg(palette.accent)
+                                    .fg(palette.bg)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(palette.fg)
+                            };
+                            ListItem::new(Line::from(vec![
+                                Span::styled(if i == bulk_action_idx { "→ " } else { "  " }, style),
+                                Span::styled(label.to_string(), style),
+                            ]))
+                        })
+                        .collect();
+                    let list = List::new(items).block(block);
+                    f.render_widget(ratatui::widgets::Clear, area);
+                    f.render_widget(list, area);
+                }
+
+                if palette_state.open {
+                    let area = centered_rect(70, 60, f.area());
+                    palette::draw_palette(f, area, &palette_state, palette);
                 }
             })?;
             needs_draw = false;
@@ -2336,18 +3548,65 @@ pub fn run_tui(
 
         if crossterm::event::poll(timeout)? {
             let event = event::read()?;
+            help_last_interaction = Instant::now();
 
             // Handle mouse events (skip when modal is open)
             if let Event::Mouse(mouse) = event {
-                // Ignore mouse events when help or detail modal is open
-                if show_help || show_detail_modal {
+                // Ignore mouse events when help, detail, or bulk modal is open
+                if show_help || show_detail_modal || show_bulk_modal {
                     continue;
                 }
                 needs_draw = true;
+                let mut pill_clicked = false;
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         let col = mouse.column;
                         let row = mouse.row;
+
+                        // Check pill clicks (edit mode)
+                        for (rect, pill) in &last_pill_rects {
+                            if col >= rect.x
+                                && col < rect.x + rect.width
+                                && row >= rect.y
+                                && row < rect.y + rect.height
+                            {
+                                match pill.label.as_str() {
+                                    "agent" => {
+                                        input_mode = InputMode::Agent;
+                                        input_buffer = pill.value.clone();
+                                        status = "Edit agent filter".to_string();
+                                        dirty_since = None;
+                                    }
+                                    "ws" => {
+                                        input_mode = InputMode::Workspace;
+                                        input_buffer = pill.value.clone();
+                                        status = "Edit workspace filter".to_string();
+                                        dirty_since = None;
+                                    }
+                                    "time" => {
+                                        input_mode = InputMode::CreatedFrom;
+                                        input_buffer.clear();
+                                        status =
+                                            "Enter start date (YYYY-MM-DD) or -7d/-24h".to_string();
+                                        dirty_since = None;
+                                    }
+                                    "pane" => {
+                                        input_mode = InputMode::PaneFilter;
+                                        input_buffer = pill.value.clone();
+                                        status =
+                                            "Edit pane filter (Enter apply, Esc clear)".to_string();
+                                        dirty_since = None;
+                                    }
+                                    _ => {}
+                                }
+                                needs_draw = true;
+                                pill_clicked = true;
+                                break;
+                            }
+                        }
+                        if pill_clicked {
+                            continue;
+                        }
 
                         // Check if click is in detail area
                         if let Some(detail_rect) = last_detail_area
@@ -2444,6 +3703,291 @@ pub fn run_tui(
             // Global quit override
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 break;
+            }
+
+            // Command palette handling takes precedence over help/detail.
+            if palette_state.open {
+                match key.code {
+                    KeyCode::Esc => {
+                        palette_state.open = false;
+                        palette_state.query.clear();
+                        palette_state.refilter();
+                    }
+                    KeyCode::Up => palette_state.move_selection(-1),
+                    KeyCode::Down => palette_state.move_selection(1),
+                    KeyCode::PageUp => palette_state.move_selection(-5),
+                    KeyCode::PageDown => palette_state.move_selection(5),
+                    KeyCode::Enter => {
+                        if let Some(item) = palette_state.filtered.get(palette_state.selected) {
+                            match item.action {
+                                PaletteAction::ToggleTheme => {
+                                    theme_dark = !theme_dark;
+                                }
+                                PaletteAction::ToggleDensity => {
+                                    context_window = match context_window {
+                                        ContextWindow::Small => ContextWindow::Medium,
+                                        ContextWindow::Medium => ContextWindow::Large,
+                                        ContextWindow::Large => ContextWindow::Small,
+                                        ContextWindow::XLarge => ContextWindow::Small,
+                                    };
+                                }
+                                PaletteAction::ToggleHelpStrip => {
+                                    help_pinned = !help_pinned;
+                                }
+                                PaletteAction::OpenUpdateBanner => {
+                                    status = "Update check: not yet wired".to_string();
+                                }
+                                PaletteAction::FilterAgent => {
+                                    input_mode = InputMode::Agent;
+                                    input_buffer.clear();
+                                }
+                                PaletteAction::FilterWorkspace => {
+                                    input_mode = InputMode::Workspace;
+                                    input_buffer.clear();
+                                }
+                                PaletteAction::FilterToday => {
+                                    if let Some((start, _)) = quick_date_range_today() {
+                                        filters.created_from = Some(start);
+                                        filters.created_to = None;
+                                        dirty_since = Some(Instant::now());
+                                    }
+                                }
+                                PaletteAction::FilterWeek => {
+                                    if let Some((start, _)) = quick_date_range_week() {
+                                        filters.created_from = Some(start);
+                                        filters.created_to = None;
+                                        dirty_since = Some(Instant::now());
+                                    }
+                                }
+                                PaletteAction::FilterCustomDate => {
+                                    input_mode = InputMode::CreatedFrom;
+                                    input_buffer.clear();
+                                    status = "Enter start date (YYYY-MM-DD)".to_string();
+                                }
+                                PaletteAction::OpenBulkActions => {
+                                    status = "Bulk actions: select with m, open with A".to_string();
+                                }
+                                PaletteAction::ReloadIndex => {
+                                    dirty_since = Some(Instant::now());
+                                }
+                                PaletteAction::OpenSavedViews => {
+                                    status =
+                                        "Saved views: Ctrl+<n> save, Shift+<n> load".to_string();
+                                }
+                                PaletteAction::SaveViewSlot(slot) => {
+                                    status = save_view_slot(
+                                        slot,
+                                        &filters,
+                                        ranking_mode,
+                                        &mut saved_views,
+                                    );
+                                }
+                                PaletteAction::LoadViewSlot(slot) => {
+                                    if let Some(msg) = load_view_slot(
+                                        slot,
+                                        &mut filters,
+                                        &mut ranking_mode,
+                                        &saved_views,
+                                    ) {
+                                        status = msg;
+                                        dirty_since = Some(Instant::now());
+                                    } else {
+                                        status = format!("No saved view in slot {}", slot);
+                                    }
+                                }
+                            }
+                            palette_state.open = false;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        palette_state.query.pop();
+                        palette_state.refilter();
+                    }
+                    KeyCode::Char(c) => {
+                        palette_state.query.push(c);
+                        palette_state.refilter();
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Bulk action modal: handle keys when open
+            if show_bulk_modal {
+                const BULK_ACTIONS: [&str; 4] = [
+                    "Open all in editor",
+                    "Copy all paths",
+                    "Export as JSON",
+                    "Clear selection",
+                ];
+                match key.code {
+                    KeyCode::Esc => {
+                        show_bulk_modal = false;
+                        status = format!("{} items still selected", selected.len());
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        bulk_action_idx = bulk_action_idx.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        bulk_action_idx = (bulk_action_idx + 1).min(BULK_ACTIONS.len() - 1);
+                    }
+                    KeyCode::Enter => {
+                        show_bulk_modal = false;
+                        // Collect selected hits
+                        let selected_hits: Vec<&SearchHit> = selected
+                            .iter()
+                            .filter_map(|(pane_idx, hit_idx)| {
+                                panes.get(*pane_idx).and_then(|p| p.hits.get(*hit_idx))
+                            })
+                            .collect();
+                        match bulk_action_idx {
+                            0 => {
+                                // Open all in editor
+                                let editor = std::env::var("EDITOR")
+                                    .or_else(|_| std::env::var("VISUAL"))
+                                    .unwrap_or_else(|_| "code".to_string());
+                                // Exit raw mode
+                                disable_raw_mode().ok();
+                                execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)
+                                    .ok();
+                                for hit in &selected_hits {
+                                    let mut cmd = StdCommand::new(&editor);
+                                    if editor == "code" {
+                                        if let Some(ln) = hit.line_number {
+                                            cmd.arg("--goto")
+                                                .arg(format!("{}:{}", hit.source_path, ln));
+                                        } else {
+                                            cmd.arg(&hit.source_path);
+                                        }
+                                    } else {
+                                        cmd.arg(&hit.source_path);
+                                    }
+                                    let _ = cmd.status();
+                                }
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+                                    .ok();
+                                enable_raw_mode().ok();
+                                status =
+                                    format!("Opened {} files in {}", selected_hits.len(), editor);
+                                selected.clear();
+                            }
+                            1 => {
+                                // Copy all paths
+                                let paths: Vec<String> = selected_hits
+                                    .iter()
+                                    .map(|h| h.source_path.clone())
+                                    .collect();
+                                let text = paths.join("\n");
+                                let clipboard_cmd = if cfg!(target_os = "macos") {
+                                    Some("pbcopy")
+                                } else if StdCommand::new("which")
+                                    .arg("xclip")
+                                    .output()
+                                    .map(|o| o.status.success())
+                                    .unwrap_or(false)
+                                {
+                                    Some("xclip -selection clipboard")
+                                } else if StdCommand::new("which")
+                                    .arg("xsel")
+                                    .output()
+                                    .map(|o| o.status.success())
+                                    .unwrap_or(false)
+                                {
+                                    Some("xsel --clipboard --input")
+                                } else {
+                                    None
+                                };
+                                status = if let Some(cmd) = clipboard_cmd {
+                                    let result = StdCommand::new("sh")
+                                        .arg("-c")
+                                        .arg(cmd)
+                                        .stdin(std::process::Stdio::piped())
+                                        .spawn()
+                                        .and_then(|mut child| {
+                                            use std::io::Write;
+                                            if let Some(stdin) = child.stdin.as_mut() {
+                                                stdin.write_all(text.as_bytes())?;
+                                            }
+                                            child.wait()
+                                        });
+                                    if result.map(|s| s.success()).unwrap_or(false) {
+                                        selected.clear();
+                                        format!("✓ Copied {} paths to clipboard", paths.len())
+                                    } else {
+                                        "✗ Clipboard copy failed".to_string()
+                                    }
+                                } else {
+                                    "✗ No clipboard tool found".to_string()
+                                };
+                            }
+                            2 => {
+                                // Export as JSON
+                                let export: Vec<serde_json::Value> = selected_hits
+                                    .iter()
+                                    .map(|h| {
+                                        serde_json::json!({
+                                            "source_path": h.source_path,
+                                            "line_number": h.line_number,
+                                            "title": h.title,
+                                            "agent": h.agent,
+                                            "workspace": h.workspace,
+                                            "score": h.score,
+                                            "snippet": h.snippet,
+                                        })
+                                    })
+                                    .collect();
+                                if let Ok(json) = serde_json::to_string_pretty(&export) {
+                                    let clipboard_cmd = if cfg!(target_os = "macos") {
+                                        Some("pbcopy")
+                                    } else if StdCommand::new("which")
+                                        .arg("xclip")
+                                        .output()
+                                        .map(|o| o.status.success())
+                                        .unwrap_or(false)
+                                    {
+                                        Some("xclip -selection clipboard")
+                                    } else {
+                                        None
+                                    };
+                                    status = if let Some(cmd) = clipboard_cmd {
+                                        let result = StdCommand::new("sh")
+                                            .arg("-c")
+                                            .arg(cmd)
+                                            .stdin(std::process::Stdio::piped())
+                                            .spawn()
+                                            .and_then(|mut child| {
+                                                use std::io::Write;
+                                                if let Some(stdin) = child.stdin.as_mut() {
+                                                    stdin.write_all(json.as_bytes())?;
+                                                }
+                                                child.wait()
+                                            });
+                                        if result.map(|s| s.success()).unwrap_or(false) {
+                                            selected.clear();
+                                            format!(
+                                                "✓ Exported {} items as JSON to clipboard",
+                                                export.len()
+                                            )
+                                        } else {
+                                            "✗ JSON export failed".to_string()
+                                        }
+                                    } else {
+                                        "✗ No clipboard tool found".to_string()
+                                    };
+                                }
+                            }
+                            3 => {
+                                // Clear selection
+                                let count = selected.len();
+                                selected.clear();
+                                status = format!("Cleared {} selections", count);
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
             }
 
             // While help is open, keys scroll the help modal and do not affect panes.
@@ -2606,13 +4150,201 @@ pub fn run_tui(
                             }
                         }
                     }
+                    KeyCode::Char('o') => {
+                        // Open source file in $EDITOR or default editor
+                        if let Some(pane) = panes.get(active_pane)
+                            && let Some(hit) = pane.hits.get(pane.selected)
+                        {
+                            let path = &hit.source_path;
+                            // Determine editor: $EDITOR, $VISUAL, or fallback chain
+                            let editor = std::env::var("EDITOR")
+                                .or_else(|_| std::env::var("VISUAL"))
+                                .unwrap_or_else(|_| {
+                                    // Try common editors in order of preference
+                                    for candidate in ["code", "vim", "nano", "vi"] {
+                                        if StdCommand::new("which")
+                                            .arg(candidate)
+                                            .output()
+                                            .map(|o| o.status.success())
+                                            .unwrap_or(false)
+                                        {
+                                            return candidate.to_string();
+                                        }
+                                    }
+                                    "nano".to_string()
+                                });
+
+                            // Exit raw mode for GUI editors (code) or TUI editors
+                            disable_raw_mode().ok();
+                            execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture).ok();
+
+                            // Build command with optional line number
+                            let mut cmd = StdCommand::new(&editor);
+                            if editor == "code" {
+                                // VS Code: code --goto file:line
+                                if let Some(ln) = hit.line_number {
+                                    cmd.arg("--goto").arg(format!("{}:{}", path, ln));
+                                } else {
+                                    cmd.arg(path);
+                                }
+                            } else if editor == "vim" || editor == "vi" || editor == "nvim" {
+                                // Vim: vim +line file
+                                if let Some(ln) = hit.line_number {
+                                    cmd.arg(format!("+{}", ln));
+                                }
+                                cmd.arg(path);
+                            } else if editor == "nano" {
+                                // Nano: nano +line file
+                                if let Some(ln) = hit.line_number {
+                                    cmd.arg(format!("+{}", ln));
+                                }
+                                cmd.arg(path);
+                            } else {
+                                // Generic: just pass the path
+                                cmd.arg(path);
+                            }
+
+                            let result = cmd.status();
+
+                            // Re-enter raw mode
+                            execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture).ok();
+                            enable_raw_mode().ok();
+
+                            status = if result.map(|s| s.success()).unwrap_or(false) {
+                                format!("Opened {} in {}", path, editor)
+                            } else {
+                                format!("✗ Failed to open in {}", editor)
+                            };
+                            show_detail_modal = false;
+                            modal_scroll = 0;
+                        }
+                    }
+                    KeyCode::Char('p') => {
+                        // Copy source path to clipboard
+                        if let Some(pane) = panes.get(active_pane)
+                            && let Some(hit) = pane.hits.get(pane.selected)
+                        {
+                            let path = &hit.source_path;
+                            let clipboard_cmd = if cfg!(target_os = "macos") {
+                                Some("pbcopy")
+                            } else if StdCommand::new("which")
+                                .arg("xclip")
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false)
+                            {
+                                Some("xclip -selection clipboard")
+                            } else if StdCommand::new("which")
+                                .arg("xsel")
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false)
+                            {
+                                Some("xsel --clipboard --input")
+                            } else {
+                                None
+                            };
+
+                            status = if let Some(cmd) = clipboard_cmd {
+                                let result = StdCommand::new("sh")
+                                    .arg("-c")
+                                    .arg(cmd)
+                                    .stdin(std::process::Stdio::piped())
+                                    .spawn()
+                                    .and_then(|mut child| {
+                                        use std::io::Write;
+                                        if let Some(stdin) = child.stdin.as_mut() {
+                                            stdin.write_all(path.as_bytes())?;
+                                        }
+                                        child.wait()
+                                    });
+                                if result.map(|s| s.success()).unwrap_or(false) {
+                                    format!("✓ Path copied: {}", path)
+                                } else {
+                                    "✗ Clipboard copy failed".to_string()
+                                }
+                            } else {
+                                "✗ No clipboard tool found".to_string()
+                            };
+                        }
+                    }
+                    KeyCode::Char('s') => {
+                        // Copy snippet to clipboard
+                        if let Some(pane) = panes.get(active_pane)
+                            && let Some(hit) = pane.hits.get(pane.selected)
+                        {
+                            let snippet = &hit.snippet;
+                            let clipboard_cmd = if cfg!(target_os = "macos") {
+                                Some("pbcopy")
+                            } else if StdCommand::new("which")
+                                .arg("xclip")
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false)
+                            {
+                                Some("xclip -selection clipboard")
+                            } else if StdCommand::new("which")
+                                .arg("xsel")
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false)
+                            {
+                                Some("xsel --clipboard --input")
+                            } else {
+                                None
+                            };
+
+                            status = if let Some(cmd) = clipboard_cmd {
+                                let result = StdCommand::new("sh")
+                                    .arg("-c")
+                                    .arg(cmd)
+                                    .stdin(std::process::Stdio::piped())
+                                    .spawn()
+                                    .and_then(|mut child| {
+                                        use std::io::Write;
+                                        if let Some(stdin) = child.stdin.as_mut() {
+                                            stdin.write_all(snippet.as_bytes())?;
+                                        }
+                                        child.wait()
+                                    });
+                                if result.map(|s| s.success()).unwrap_or(false) {
+                                    "✓ Snippet copied to clipboard".to_string()
+                                } else {
+                                    "✗ Clipboard copy failed".to_string()
+                                }
+                            } else {
+                                "✗ No clipboard tool found".to_string()
+                            };
+                        }
+                    }
                     _ => {}
                 }
                 continue;
             }
+
+            // Open command palette (Ctrl+P or Alt+P)
+            if matches!(key.code, KeyCode::Char('p'))
+                && (key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT))
+            {
+                palette_state.open = true;
+                palette_state.query.clear();
+                palette_state.selected = 0;
+                palette_state.refilter();
+                continue;
+            }
+
             match input_mode {
                 InputMode::Query => {
                     if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        if let KeyCode::Char(c) = key.code
+                            && c.is_ascii_digit()
+                            && c != '0'
+                        {
+                            let slot = c.to_digit(10).unwrap() as u8;
+                            status = save_view_slot(slot, &filters, ranking_mode, &mut saved_views);
+                            continue;
+                        }
                         // Handle both 'r' and 'R' since Shift modifier may change the char
                         if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
                             // Ctrl+Shift+R = refresh search (re-query index)
@@ -2644,9 +4376,46 @@ pub fn run_tui(
                     }
 
                     match key.code {
+                        KeyCode::Char(c)
+                            if key.modifiers.contains(KeyModifiers::SHIFT)
+                                && c.is_ascii_digit()
+                                && c != '0' =>
+                        {
+                            let slot = c.to_digit(10).unwrap() as u8;
+                            if let Some(msg) =
+                                load_view_slot(slot, &mut filters, &mut ranking_mode, &saved_views)
+                            {
+                                status = msg;
+                                page = 0;
+                                dirty_since = Some(Instant::now());
+                                cached_detail = None;
+                                detail_scroll = 0;
+                            } else {
+                                status = format!("No saved view in slot {}", slot);
+                            }
+                        }
+                        KeyCode::Backspace if query.is_empty() => {
+                            // Clear the last applied filter (time -> workspace -> agent)
+                            if filters.created_from.is_some() || filters.created_to.is_some() {
+                                filters.created_from = None;
+                                filters.created_to = None;
+                                status = "Cleared time filter".to_string();
+                            } else if !filters.workspaces.is_empty() {
+                                filters.workspaces.clear();
+                                status = "Cleared workspace filter".to_string();
+                            } else if !filters.agents.is_empty() {
+                                filters.agents.clear();
+                                status = "Cleared agent filter".to_string();
+                            }
+                            dirty_since = Some(Instant::now());
+                        }
                         KeyCode::Esc | KeyCode::F(10) => {
-                            // If in Detail, Esc goes back to Results.
-                            if matches!(focus_region, FocusRegion::Detail) {
+                            // Priority: 1) Clear selection 2) Exit Detail 3) Quit
+                            if !selected.is_empty() {
+                                let count = selected.len();
+                                selected.clear();
+                                status = format!("Cleared {} selections", count);
+                            } else if matches!(focus_region, FocusRegion::Detail) {
                                 focus_region = FocusRegion::Results;
                                 status = "Focus: Results".to_string();
                             } else {
@@ -2817,6 +4586,60 @@ pub fn run_tui(
                                 }
                             }
                         }
+                        // Multi-select: 'm' toggles selection on current item
+                        KeyCode::Char('m') => {
+                            if let Some(pane) = panes.get(active_pane) {
+                                let key = (active_pane, pane.selected);
+                                if selected.contains(&key) {
+                                    selected.remove(&key);
+                                    status = format!("Deselected ({} selected)", selected.len());
+                                } else {
+                                    selected.insert(key);
+                                    status = format!(
+                                        "Selected ({} total) · m toggle · A bulk actions · Esc clear",
+                                        selected.len()
+                                    );
+                                }
+                            }
+                        }
+                        // Multi-select: Ctrl+A selects all items in current pane
+                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(pane) = panes.get(active_pane) {
+                                let all_selected = (0..pane.hits.len())
+                                    .all(|i| selected.contains(&(active_pane, i)));
+                                if all_selected {
+                                    // Deselect all in this pane
+                                    for i in 0..pane.hits.len() {
+                                        selected.remove(&(active_pane, i));
+                                    }
+                                    status = format!(
+                                        "Deselected all in pane ({} total)",
+                                        selected.len()
+                                    );
+                                } else {
+                                    // Select all in this pane
+                                    for i in 0..pane.hits.len() {
+                                        selected.insert((active_pane, i));
+                                    }
+                                    status = format!(
+                                        "Selected all in pane ({} total) · A bulk actions",
+                                        selected.len()
+                                    );
+                                }
+                            }
+                        }
+                        // Bulk action menu: A opens when items are selected
+                        KeyCode::Char('A') => {
+                            if !selected.is_empty() {
+                                show_bulk_modal = true;
+                                bulk_action_idx = 0;
+                                status = "Bulk actions: ↑↓ navigate · Enter execute · Esc cancel"
+                                    .to_string();
+                            } else {
+                                status = "No items selected. m to select, Ctrl+A to select all."
+                                    .to_string();
+                            }
+                        }
                         KeyCode::F(1) => {
                             show_help = !show_help;
                             help_scroll = 0;
@@ -2899,10 +4722,32 @@ pub fn run_tui(
                             detail_scroll = 0;
                         }
                         KeyCode::F(5) => {
-                            input_mode = InputMode::CreatedFrom;
-                            input_buffer.clear();
-                            status = "From: -7d, yesterday, 2024-11-25 | Enter=apply, Esc=cancel"
-                                .to_string();
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                // Cycle time presets: 24h -> 7d -> 30d -> All
+                                const PRESETS: &[(i64, &str)] = &[
+                                    (24, "last 24h"),
+                                    (7 * 24, "last 7d"),
+                                    (30 * 24, "last 30d"),
+                                    (0, "all time"),
+                                ];
+                                let (hours, label) = PRESETS[time_preset_idx % PRESETS.len()];
+                                time_preset_idx = (time_preset_idx + 1) % PRESETS.len();
+                                if hours == 0 {
+                                    filters.created_from = None;
+                                    filters.created_to = None;
+                                } else if let Some((start, now)) = quick_date_range_hours(hours) {
+                                    filters.created_from = Some(start);
+                                    filters.created_to = Some(now);
+                                }
+                                status = format!("Time preset: {}", label);
+                                dirty_since = Some(Instant::now());
+                            } else {
+                                input_mode = InputMode::CreatedFrom;
+                                input_buffer.clear();
+                                status =
+                                    "From: -7d, yesterday, 2024-11-25 | Enter=apply, Esc=cancel"
+                                        .to_string();
+                            }
                         }
                         KeyCode::F(6) => {
                             input_mode = InputMode::CreatedTo;
@@ -2920,11 +4765,49 @@ pub fn run_tui(
                             );
                             dirty_since = Some(Instant::now());
                         }
+                        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            fancy_borders = !fancy_borders;
+                            status = format!(
+                                "Borders: {}",
+                                if fancy_borders {
+                                    "rounded (unicode)"
+                                } else {
+                                    "plain (ASCII)"
+                                }
+                            );
+                            needs_draw = true;
+                        }
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            density_mode = density_mode.next();
+                            // Recalculate pane limit with new density
+                            let height = terminal.size().map(|r| r.height).unwrap_or(24);
+                            per_pane_limit = calculate_pane_limit(height, density_mode);
+                            let prev_agent = active_hit(&panes, active_pane)
+                                .map(|h| h.agent.clone())
+                                .or_else(|| panes.get(active_pane).map(|p| p.agent.clone()));
+                            let prev_path =
+                                active_hit(&panes, active_pane).map(|h| h.source_path.clone());
+                            panes = rebuild_panes_with_filter(
+                                &results,
+                                pane_filter.as_deref(),
+                                per_pane_limit,
+                                &mut active_pane,
+                                &mut pane_scroll_offset,
+                                prev_agent,
+                                prev_path,
+                                MAX_VISIBLE_PANES,
+                            );
+                            status = format!("Density: {}", density_mode.label());
+                            needs_draw = true;
+                        }
                         KeyCode::F(12) => {
                             ranking_mode = match ranking_mode {
                                 RankingMode::RecentHeavy => RankingMode::Balanced,
                                 RankingMode::Balanced => RankingMode::RelevanceHeavy,
-                                RankingMode::RelevanceHeavy => RankingMode::RecentHeavy,
+                                RankingMode::RelevanceHeavy => RankingMode::MatchQualityHeavy,
+                                RankingMode::MatchQualityHeavy => RankingMode::DateNewest,
+                                RankingMode::DateNewest => RankingMode::DateOldest,
+                                RankingMode::DateOldest => RankingMode::RecentHeavy,
                             };
                             status = format!(
                                 "Ranking: {}",
@@ -2932,12 +4815,16 @@ pub fn run_tui(
                                     RankingMode::RecentHeavy => "recent-heavy",
                                     RankingMode::Balanced => "balanced",
                                     RankingMode::RelevanceHeavy => "relevance-heavy",
+                                    RankingMode::MatchQualityHeavy => "match-quality",
+                                    RankingMode::DateNewest => "date (newest first)",
+                                    RankingMode::DateOldest => "date (oldest first)",
                                 }
                             );
                             dirty_since = Some(Instant::now());
                         }
                         KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             filters = SearchFilters::default();
+                            pane_filter = None;
                             page = 0;
                             status = format!(
                                 "Filters cleared | mode: {}",
@@ -3014,9 +4901,81 @@ pub fn run_tui(
                             detail_scroll = 0;
                         }
                         KeyCode::Char(c) => {
-                            // Reset focus to results if typing
+                            // Detail pane local find/navigation
                             if matches!(focus_region, FocusRegion::Detail) {
+                                if c == '/' {
+                                    input_mode = InputMode::DetailFind;
+                                    input_buffer.clear();
+                                    detail_find = None;
+                                    status = "Detail find: type to search this conversation (Enter apply, Esc cancel)"
+                                        .to_string();
+                                    needs_draw = true;
+                                    continue;
+                                }
+                                if c == 'n' || c == 'N' {
+                                    if let Some(df) = detail_find.as_mut() {
+                                        if df.matches.is_empty() {
+                                            status = format!("No matches for \"{}\"", df.query);
+                                        } else {
+                                            let len = df.matches.len();
+                                            if c == 'n' {
+                                                df.current = (df.current + 1) % len;
+                                            } else {
+                                                df.current =
+                                                    df.current.checked_sub(1).unwrap_or(len - 1);
+                                            }
+                                            detail_scroll = df.matches[df.current];
+                                            status = format!(
+                                                "Match {}/{} for \"{}\"",
+                                                df.current + 1,
+                                                len,
+                                                df.query
+                                            );
+                                        }
+                                    } else {
+                                        status = "Start detail find with / (in Detail)".to_string();
+                                    }
+                                    needs_draw = true;
+                                    continue;
+                                }
+                                // Other typing returns focus to results/query
                                 focus_region = FocusRegion::Results;
+                            }
+
+                            // dft.1: Handle 1/2/3 shortcuts to apply did-you-mean suggestions
+                            if panes.is_empty()
+                                && !suggestions.is_empty()
+                                && ('1'..='3').contains(&c)
+                                && key.modifiers.is_empty()
+                            {
+                                let idx = c.to_digit(10).unwrap_or(1) as usize - 1;
+                                if let Some(sugg) = suggestions.get(idx) {
+                                    // Apply the suggestion
+                                    if let Some(ref new_query) = sugg.suggested_query {
+                                        query = new_query.clone();
+                                        status = format!("Applied: {}", sugg.message);
+                                    }
+                                    if let Some(ref new_filters) = sugg.suggested_filters {
+                                        filters = new_filters.clone();
+                                        status = format!("Applied: {}", sugg.message);
+                                    }
+                                    page = 0;
+                                    dirty_since = Some(Instant::now());
+                                    cached_detail = None;
+                                    detail_scroll = 0;
+                                    needs_draw = true;
+                                    continue;
+                                }
+                            }
+
+                            // Pane-local search (/) does not hit the index; it filters current panes.
+                            if c == '/' && !panes.is_empty() {
+                                input_mode = InputMode::PaneFilter;
+                                input_buffer.clear();
+                                status = "Pane filter: type to narrow current results (Esc clears)"
+                                    .to_string();
+                                needs_draw = true;
+                                continue;
                             }
 
                             if key.modifiers.contains(KeyModifiers::ALT) {
@@ -3036,7 +4995,21 @@ pub fn run_tui(
                             {
                                 per_pane_limit = (per_pane_limit + 2).min(50);
                                 status = format!("Pane size: {} items", per_pane_limit);
-                                panes = build_agent_panes(&results, per_pane_limit);
+                                let prev_agent = active_hit(&panes, active_pane)
+                                    .map(|h| h.agent.clone())
+                                    .or_else(|| panes.get(active_pane).map(|p| p.agent.clone()));
+                                let prev_path =
+                                    active_hit(&panes, active_pane).map(|h| h.source_path.clone());
+                                panes = rebuild_panes_with_filter(
+                                    &results,
+                                    pane_filter.as_deref(),
+                                    per_pane_limit,
+                                    &mut active_pane,
+                                    &mut pane_scroll_offset,
+                                    prev_agent,
+                                    prev_path,
+                                    MAX_VISIBLE_PANES,
+                                );
                                 dirty_since = Some(Instant::now());
                                 continue;
                             }
@@ -3045,7 +5018,21 @@ pub fn run_tui(
                             if key.modifiers.is_empty() && c == '-' && !panes.is_empty() {
                                 per_pane_limit = per_pane_limit.saturating_sub(2).max(4);
                                 status = format!("Pane size: {} items", per_pane_limit);
-                                panes = build_agent_panes(&results, per_pane_limit);
+                                let prev_agent = active_hit(&panes, active_pane)
+                                    .map(|h| h.agent.clone())
+                                    .or_else(|| panes.get(active_pane).map(|p| p.agent.clone()));
+                                let prev_path =
+                                    active_hit(&panes, active_pane).map(|h| h.source_path.clone());
+                                panes = rebuild_panes_with_filter(
+                                    &results,
+                                    pane_filter.as_deref(),
+                                    per_pane_limit,
+                                    &mut active_pane,
+                                    &mut pane_scroll_offset,
+                                    prev_agent,
+                                    prev_path,
+                                    MAX_VISIBLE_PANES,
+                                );
                                 dirty_since = Some(Instant::now());
                                 continue;
                             }
@@ -3449,6 +5436,154 @@ pub fn run_tui(
                     KeyCode::Char(c) => input_buffer.push(c),
                     _ => {}
                 },
+                InputMode::PaneFilter => match key.code {
+                    KeyCode::Esc => {
+                        pane_filter = None;
+                        input_buffer.clear();
+                        input_mode = InputMode::Query;
+                        cached_detail = None;
+                        detail_scroll = 0;
+                        let prev_agent = active_hit(&panes, active_pane)
+                            .map(|h| h.agent.clone())
+                            .or_else(|| panes.get(active_pane).map(|p| p.agent.clone()));
+                        let prev_path =
+                            active_hit(&panes, active_pane).map(|h| h.source_path.clone());
+                        panes = rebuild_panes_with_filter(
+                            &results,
+                            pane_filter.as_deref(),
+                            per_pane_limit,
+                            &mut active_pane,
+                            &mut pane_scroll_offset,
+                            prev_agent,
+                            prev_path,
+                            MAX_VISIBLE_PANES,
+                        );
+                        status = "Pane filter cleared".to_string();
+                        needs_draw = true;
+                    }
+                    KeyCode::Enter => {
+                        pane_filter = if input_buffer.trim().is_empty() {
+                            None
+                        } else {
+                            Some(input_buffer.trim().to_string())
+                        };
+                        input_buffer.clear();
+                        input_mode = InputMode::Query;
+                        cached_detail = None;
+                        detail_scroll = 0;
+                        let prev_agent = active_hit(&panes, active_pane)
+                            .map(|h| h.agent.clone())
+                            .or_else(|| panes.get(active_pane).map(|p| p.agent.clone()));
+                        let prev_path =
+                            active_hit(&panes, active_pane).map(|h| h.source_path.clone());
+                        panes = rebuild_panes_with_filter(
+                            &results,
+                            pane_filter.as_deref(),
+                            per_pane_limit,
+                            &mut active_pane,
+                            &mut pane_scroll_offset,
+                            prev_agent,
+                            prev_path,
+                            MAX_VISIBLE_PANES,
+                        );
+                        status = if pane_filter
+                            .as_ref()
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false)
+                        {
+                            "Pane filter applied".to_string()
+                        } else {
+                            "Pane filter cleared".to_string()
+                        };
+                        needs_draw = true;
+                    }
+                    KeyCode::Backspace => {
+                        input_buffer.pop();
+                        pane_filter = if input_buffer.trim().is_empty() {
+                            None
+                        } else {
+                            Some(input_buffer.trim().to_string())
+                        };
+                        cached_detail = None;
+                        detail_scroll = 0;
+                        let prev_agent = active_hit(&panes, active_pane)
+                            .map(|h| h.agent.clone())
+                            .or_else(|| panes.get(active_pane).map(|p| p.agent.clone()));
+                        let prev_path =
+                            active_hit(&panes, active_pane).map(|h| h.source_path.clone());
+                        panes = rebuild_panes_with_filter(
+                            &results,
+                            pane_filter.as_deref(),
+                            per_pane_limit,
+                            &mut active_pane,
+                            &mut pane_scroll_offset,
+                            prev_agent,
+                            prev_path,
+                            MAX_VISIBLE_PANES,
+                        );
+                        needs_draw = true;
+                    }
+                    KeyCode::Char(c) => {
+                        input_buffer.push(c);
+                        pane_filter = Some(input_buffer.clone());
+                        cached_detail = None;
+                        detail_scroll = 0;
+                        let prev_agent = active_hit(&panes, active_pane)
+                            .map(|h| h.agent.clone())
+                            .or_else(|| panes.get(active_pane).map(|p| p.agent.clone()));
+                        let prev_path =
+                            active_hit(&panes, active_pane).map(|h| h.source_path.clone());
+                        panes = rebuild_panes_with_filter(
+                            &results,
+                            pane_filter.as_deref(),
+                            per_pane_limit,
+                            &mut active_pane,
+                            &mut pane_scroll_offset,
+                            prev_agent,
+                            prev_path,
+                            MAX_VISIBLE_PANES,
+                        );
+                        needs_draw = true;
+                    }
+                    _ => {}
+                },
+                InputMode::DetailFind => match key.code {
+                    KeyCode::Esc => {
+                        detail_find = None;
+                        input_buffer.clear();
+                        input_mode = InputMode::Query;
+                        status = "Detail find cancelled".to_string();
+                        focus_region = FocusRegion::Detail;
+                        needs_draw = true;
+                    }
+                    KeyCode::Enter => {
+                        let term = input_buffer.trim().to_string();
+                        if term.is_empty() {
+                            detail_find = None;
+                            status = "Detail find cleared".to_string();
+                        } else {
+                            detail_find = Some(DetailFindState {
+                                query: term.clone(),
+                                matches: Vec::new(),
+                                current: 0,
+                            });
+                            status = format!("Detail find: \"{}\"", term);
+                            detail_scroll = 0;
+                        }
+                        input_buffer.clear();
+                        input_mode = InputMode::Query;
+                        dirty_since = Some(Instant::now());
+                        focus_region = FocusRegion::Detail;
+                        needs_draw = true;
+                    }
+                    KeyCode::Backspace => {
+                        input_buffer.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        input_buffer.push(c);
+                    }
+                    _ => {}
+                },
             }
         }
 
@@ -3467,15 +5602,81 @@ pub fn run_tui(
                     let q = apply_match_mode(&query, match_mode);
                     // Use search_with_fallback for implicit wildcard expansion on sparse results
                     const SPARSE_THRESHOLD: usize = 3;
-                    match client.search_with_fallback(&q, filters.clone(), page_size, page * page_size, SPARSE_THRESHOLD) {
+                    let search_started = Instant::now();
+                    match client.search_with_fallback(
+                        &q,
+                        filters.clone(),
+                        page_size,
+                        page * page_size,
+                        SPARSE_THRESHOLD,
+                    ) {
                         Ok(search_result) => {
+                            last_search_ms = Some(search_started.elapsed().as_millis());
                             let hits = search_result.hits;
+                            cache_stats = if cache_debug {
+                                Some(search_result.cache_stats)
+                            } else {
+                                None
+                            };
                             wildcard_fallback = search_result.wildcard_fallback;
+                            suggestions = search_result.suggestions;
                             dirty_since = None;
+                            // dft.2: Zero-match recent fallback
+                            // When search returns 0 results for a non-empty query, fall back to
+                            // showing recent conversations per agent
+                            let use_recent_fallback = hits.is_empty()
+                                && page == 0
+                                && !q.trim().is_empty()
+                                && pane_filter.is_none();
+
                             if hits.is_empty() && page > 0 {
                                 page = page.saturating_sub(1);
                                 active_pane = 0;
                                 dirty_since = Some(Instant::now());
+                                needs_draw = true;
+                            } else if use_recent_fallback {
+                                // Fetch recent results with no query filter (dft.2)
+                                let fallback_filters = SearchFilters::default();
+                                match client.search("", fallback_filters, page_size, 0) {
+                                    Ok(recent_hits) => {
+                                        results = recent_hits;
+                                        // Sort by recency (newest first)
+                                        results.sort_by(|a, b| {
+                                            let ts_a = a.created_at.unwrap_or(0);
+                                            let ts_b = b.created_at.unwrap_or(0);
+                                            ts_b.cmp(&ts_a)
+                                        });
+                                    }
+                                    Err(_) => {
+                                        results = Vec::new();
+                                    }
+                                }
+                                // Build panes from fallback results
+                                panes = rebuild_panes_with_filter(
+                                    &results,
+                                    None, // No pane filter for fallback
+                                    per_pane_limit,
+                                    &mut active_pane,
+                                    &mut pane_scroll_offset,
+                                    prev_agent.clone(),
+                                    prev_path.clone(),
+                                    MAX_VISIBLE_PANES,
+                                );
+                                selected.clear();
+                                let total_hits: usize = panes.iter().map(|p| p.total_count).sum();
+                                if total_hits > 0 {
+                                    status = format!(
+                                        "No matches for \"{}\". Showing {} recent across {} agents.",
+                                        q.chars().take(20).collect::<String>(),
+                                        total_hits,
+                                        panes.len()
+                                    );
+                                } else {
+                                    status = format!(
+                                        "No matches for \"{}\".",
+                                        q.chars().take(30).collect::<String>()
+                                    );
+                                }
                                 needs_draw = true;
                             } else {
                                 results = hits;
@@ -3485,62 +5686,78 @@ pub fn run_tui(
                                     .max()
                                     .unwrap_or(0)
                                     as f32;
-                                let alpha = match ranking_mode {
-                                    RankingMode::RecentHeavy => 1.0,
-                                    RankingMode::Balanced => 0.4,
-                                    RankingMode::RelevanceHeavy => 0.1,
-                                };
-                                results.sort_by(|a, b| {
-                                    let recency = |h: &SearchHit| -> f32 {
-                                        if max_created <= 0.0 {
-                                            return 0.0;
+                                // Handle pure date sorting modes separately
+                                if matches!(
+                                    ranking_mode,
+                                    RankingMode::DateNewest | RankingMode::DateOldest
+                                ) {
+                                    results.sort_by(|a, b| {
+                                        let ts_a = a.created_at.unwrap_or(0);
+                                        let ts_b = b.created_at.unwrap_or(0);
+                                        if matches!(ranking_mode, RankingMode::DateNewest) {
+                                            ts_b.cmp(&ts_a) // Descending (newest first)
+                                        } else {
+                                            ts_a.cmp(&ts_b) // Ascending (oldest first)
                                         }
-                                        h.created_at.map(|v| v as f32 / max_created).unwrap_or(0.0)
+                                    });
+                                } else {
+                                    // Alpha: recency weight factor for blended ranking
+                                    let alpha = match ranking_mode {
+                                        RankingMode::RecentHeavy => 1.0,
+                                        RankingMode::Balanced => 0.4,
+                                        RankingMode::RelevanceHeavy => 0.1,
+                                        RankingMode::MatchQualityHeavy => 0.2, // Low recency, high quality focus
+                                        RankingMode::DateNewest | RankingMode::DateOldest => {
+                                            unreachable!()
+                                        }
                                     };
-                                    let score_a = a.score + alpha * recency(a);
-                                    let score_b = b.score + alpha * recency(b);
-                                    score_b
-                                        .partial_cmp(&score_a)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                panes = build_agent_panes(&results, per_pane_limit);
-                                if !panes.is_empty()
-                                    && let Some(agent) = prev_agent
-                                {
-                                    if let Some(idx) =
-                                        panes.iter().position(|pane| pane.agent == agent)
-                                    {
-                                        active_pane = idx;
-                                        if let Some(path) = prev_path
-                                            && let Some(hit_idx) = panes[idx]
-                                                .hits
-                                                .iter()
-                                                .position(|h| h.source_path == path)
-                                        {
-                                            panes[idx].selected = hit_idx;
-                                        }
-                                    } else {
-                                        active_pane = 0;
-                                    }
+                                    // Per-hit quality factor based on match_type
+                                    //   Exact: 1.0, Prefix: 0.9, Suffix: 0.8,
+                                    //   Substring: 0.7, ImplicitWildcard: 0.6
+                                    let quality_factor =
+                                        |h: &SearchHit| -> f32 { h.match_type.quality_factor() };
+                                    results.sort_by(|a, b| {
+                                        let recency = |h: &SearchHit| -> f32 {
+                                            if max_created <= 0.0 {
+                                                return 0.0;
+                                            }
+                                            h.created_at
+                                                .map(|v| v as f32 / max_created)
+                                                .unwrap_or(0.0)
+                                        };
+                                        let score_a =
+                                            (a.score * quality_factor(a)) + alpha * recency(a);
+                                        let score_b =
+                                            (b.score * quality_factor(b)) + alpha * recency(b);
+                                        score_b
+                                            .partial_cmp(&score_a)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    });
                                 }
-                                if panes.is_empty() {
-                                    active_pane = 0;
-                                }
-                                // Ensure scroll offset puts active_pane in visible range
-                                if active_pane < pane_scroll_offset {
-                                    pane_scroll_offset = active_pane;
-                                } else if active_pane >= pane_scroll_offset + MAX_VISIBLE_PANES {
-                                    pane_scroll_offset =
-                                        active_pane.saturating_sub(MAX_VISIBLE_PANES - 1);
-                                }
-                                // Reset scroll if it's beyond available panes
-                                if pane_scroll_offset > panes.len().saturating_sub(1) {
-                                    pane_scroll_offset = 0;
-                                }
+                                panes = rebuild_panes_with_filter(
+                                    &results,
+                                    pane_filter.as_deref(),
+                                    per_pane_limit,
+                                    &mut active_pane,
+                                    &mut pane_scroll_offset,
+                                    prev_agent,
+                                    prev_path,
+                                    MAX_VISIBLE_PANES,
+                                );
+                                // Clear multi-selection when results change
+                                selected.clear();
                                 // Show a clean, user-friendly status
                                 let total_hits: usize = panes.iter().map(|p| p.total_count).sum();
                                 status = if total_hits == 0 {
-                                    "No results found".to_string()
+                                    if pane_filter
+                                        .as_ref()
+                                        .map(|s| !s.trim().is_empty())
+                                        .unwrap_or(false)
+                                    {
+                                        "No results match pane filter".to_string()
+                                    } else {
+                                        "No results found".to_string()
+                                    }
                                 } else if panes.len() == 1 {
                                     format!("{} results", total_hits)
                                 } else {
@@ -3558,7 +5775,9 @@ pub fn run_tui(
                             tracing::warn!("search error: {err}");
                             results.clear();
                             panes.clear();
+                            selected.clear();
                             active_pane = 0;
+                            cache_stats = None;
                             needs_draw = true;
                         }
                     }
@@ -3583,12 +5802,34 @@ pub fn run_tui(
             MatchMode::Prefix => "prefix".into(),
         }),
         context_window: Some(context_window.label().into()),
+        density_mode: Some(density_mode.label().into()),
         // Mark that user has seen (or had opportunity to see) the help overlay
         has_seen_help: Some(true),
         // Persist query history for next session, deduplicating prefix pollution
         query_history: Some(dedupe_history_prefixes(
             query_history.iter().cloned().collect(),
         )),
+        help_pinned: Some(help_pinned),
+        saved_views: Some(
+            saved_views
+                .iter()
+                .map(|v| SavedViewPersisted {
+                    slot: v.slot,
+                    agents: v.agents.iter().cloned().collect(),
+                    workspaces: v.workspaces.iter().cloned().collect(),
+                    created_from: v.created_from,
+                    created_to: v.created_to,
+                    ranking: Some(match v.ranking {
+                        RankingMode::RecentHeavy => "recent".into(),
+                        RankingMode::RelevanceHeavy => "relevance".into(),
+                        RankingMode::MatchQualityHeavy => "quality".into(),
+                        RankingMode::DateNewest => "newest".into(),
+                        RankingMode::DateOldest => "oldest".into(),
+                        RankingMode::Balanced => "balanced".into(),
+                    }),
+                })
+                .collect(),
+        ),
     };
     save_state(&state_path, &persisted_out);
 
@@ -3619,6 +5860,10 @@ fn teardown_terminal() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::types::{Conversation, Message, MessageRole};
+    use crate::ui::data::ConversationView;
+    use serde_json::json;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -3629,8 +5874,18 @@ mod tests {
         let state = TuiStatePersisted {
             match_mode: Some("prefix".into()),
             context_window: Some("XL".into()),
+            density_mode: Some("cozy".into()),
             has_seen_help: Some(true),
             query_history: Some(vec!["test query".into(), "another search".into()]),
+            help_pinned: Some(false),
+            saved_views: Some(vec![SavedViewPersisted {
+                slot: 1,
+                agents: vec!["codex".into()],
+                workspaces: vec!["/tmp".into()],
+                created_from: Some(1),
+                created_to: Some(2),
+                ranking: Some("recent".into()),
+            }]),
         };
         save_state(&path, &state);
 
@@ -3639,6 +5894,7 @@ mod tests {
         assert_eq!(loaded.context_window.as_deref(), Some("XL"));
         assert_eq!(loaded.has_seen_help, Some(true));
         assert_eq!(loaded.query_history.as_ref().map(|v| v.len()), Some(2));
+        assert_eq!(loaded.saved_views.as_ref().map(|v| v.len()), Some(1));
     }
 
     #[test]
@@ -3691,5 +5947,121 @@ mod tests {
 
         let empty_q = contextual_snippet(text, "", ContextWindow::Small);
         assert!(!empty_q.is_empty());
+    }
+
+    /// Test count_query_matches for sux.6.6c
+    #[test]
+    fn count_query_matches_works() {
+        // Single term exact
+        assert_eq!(count_query_matches("hello world hello", "hello"), 2);
+
+        // Case insensitive
+        assert_eq!(count_query_matches("Hello HELLO hello", "hello"), 3);
+
+        // Phrase match
+        assert_eq!(
+            count_query_matches("error handling error handling", "error handling"),
+            2
+        );
+
+        // Multi-word fallback (no phrase match)
+        assert_eq!(count_query_matches("the quick brown fox", "quick fox"), 2);
+
+        // Empty query/text
+        assert_eq!(count_query_matches("", "test"), 0);
+        assert_eq!(count_query_matches("test", ""), 0);
+
+        // No matches
+        assert_eq!(count_query_matches("hello world", "xyz"), 0);
+    }
+
+    /// Test smart_word_wrap for sux.6.6d
+    #[test]
+    fn smart_word_wrap_works() {
+        // Simple case - fits on one line
+        let lines = smart_word_wrap("hello world", 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "  hello world");
+
+        // Needs wrapping - continuation gets 4-space indent
+        let long_text = "This is a long text that definitely needs to wrap across multiple lines because it exceeds the maximum width";
+        let lines = smart_word_wrap(long_text, 40);
+        assert!(lines.len() >= 2);
+        assert!(lines[0].starts_with("  ")); // 2-space indent
+        assert!(lines[1].starts_with("    ")); // 4-space continuation indent
+
+        // Empty string
+        let lines = smart_word_wrap("", 80);
+        assert!(lines.is_empty());
+
+        // Single word longer than width gets truncated
+        let lines = smart_word_wrap("superlongwordthatexceedswidth", 15);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with("…"));
+    }
+
+    // Helper for sux.6.6a test
+    fn line_to_string(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<String>()
+    }
+
+    /// Test that detail pane uses absolute timestamps (sux.6.6a)
+    #[test]
+    fn detail_uses_absolute_timestamps() {
+        let palette = ThemePalette::dark();
+        let started_at = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+            .unwrap()
+            .timestamp_millis();
+        let msg_ts = chrono::DateTime::parse_from_rfc3339("2024-01-02T04:05:06Z")
+            .unwrap()
+            .timestamp_millis();
+
+        let convo = Conversation {
+            id: Some(1),
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: None,
+            title: Some("Absolute Time Test".into()),
+            source_path: PathBuf::from("/tmp/test"),
+            started_at: Some(started_at),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: json!({}),
+            messages: Vec::new(),
+        };
+
+        let message = Message {
+            id: Some(1),
+            idx: 0,
+            role: MessageRole::Agent,
+            author: Some("agent".into()),
+            created_at: Some(msg_ts),
+            content: "hello world".into(),
+            extra_json: json!({}),
+            snippets: vec![],
+        };
+
+        let detail = ConversationView {
+            convo,
+            messages: vec![message],
+            workspace: None,
+        };
+
+        let lines = render_parsed_content(&detail, "", palette);
+        let joined = lines
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("2024-01-02 03:04:05 UTC"));
+        assert!(joined.contains("2024-01-02 04:05:06 UTC"));
+        assert!(
+            !joined.contains("ago"),
+            "detail pane should use absolute timestamps"
+        );
     }
 }

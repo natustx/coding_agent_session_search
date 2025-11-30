@@ -10,6 +10,9 @@ pub enum InputMode {
     Workspace,
     CreatedFrom,
     CreatedTo,
+    PaneFilter,
+    /// Inline find within the detail pane (local, non-indexed)
+    DetailFind,
 }
 
 #[derive(Clone, Debug)]
