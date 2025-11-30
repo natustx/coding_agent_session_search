@@ -1,4 +1,6 @@
+pub mod bookmarks;
 pub mod connectors;
+pub mod export;
 pub mod indexer;
 pub mod model;
 pub mod search;
@@ -20,6 +22,18 @@ use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 const CONTRACT_VERSION: &str = "1";
+
+fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
+    std::env::var("CASS_TEST_WATCH_PATHS")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+}
 
 /// Command-line interface.
 #[derive(Parser, Debug, Clone)]
@@ -44,6 +58,10 @@ pub struct Cli {
     /// Reduce log noise (warnings and errors only)
     #[arg(long, short = 'q', default_value_t = false)]
     pub quiet: bool,
+
+    /// Increase verbosity (show debug information)
+    #[arg(long, short = 'v', default_value_t = false)]
+    pub verbose: bool,
 
     /// Color behavior for CLI output
     #[arg(long, value_enum, default_value_t = ColorPref::Auto)]
@@ -91,9 +109,17 @@ pub enum Commands {
         #[arg(long)]
         watch: bool,
 
+        /// Trigger a single watch cycle for specific paths (comma-separated or repeated)
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        watch_once: Option<Vec<PathBuf>>,
+
         /// Override data dir (index + db). Defaults to platform data dir.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+
+        /// Output as JSON (for automation)
+        #[arg(long)]
+        json: bool,
     },
     /// Generate shell completions to stdout
     Completions {
@@ -124,9 +150,18 @@ pub enum Commands {
         /// Offset for pagination (start at Nth result)
         #[arg(long, default_value_t = 0)]
         offset: usize,
-        /// Output as JSON (--robot also works)
+        /// Output as JSON (--robot also works). Equivalent to --robot-format json
         #[arg(long, visible_alias = "robot")]
         json: bool,
+        /// Robot output format: json (pretty), jsonl (streaming), compact (single-line)
+        #[arg(long, value_enum)]
+        robot_format: Option<RobotFormat>,
+        /// Include extended metadata in robot output (elapsed_ms, wildcard_fallback, cache_stats)
+        #[arg(long)]
+        robot_meta: bool,
+        /// Human-readable display format: table (aligned columns), lines (one-liner), markdown
+        #[arg(long, value_enum)]
+        display: Option<DisplayFormat>,
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -157,6 +192,18 @@ pub enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Output diagnostic information for troubleshooting
+    Diag {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Include verbose information (file sizes, timestamps)
+        #[arg(long, short)]
+        verbose: bool,
     },
     /// View a source file at a specific line (follow up on search results)
     View {
@@ -199,6 +246,30 @@ pub enum RobotTopic {
     Examples,
     Contracts,
     Wrap,
+}
+
+/// Output format for robot/automation mode
+#[derive(Copy, Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub enum RobotFormat {
+    /// Pretty-printed JSON object (default, backward compatible)
+    #[default]
+    Json,
+    /// Newline-delimited JSON: one object per line with optional _meta header
+    Jsonl,
+    /// Compact single-line JSON (no pretty printing)
+    Compact,
+}
+
+/// Human-readable display format for CLI output (non-JSON)
+#[derive(Copy, Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub enum DisplayFormat {
+    /// Aligned columns with headers (default human-readable)
+    #[default]
+    Table,
+    /// One-liner per result with key info
+    Lines,
+    /// Markdown with role headers and code blocks
+    Markdown,
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +412,8 @@ async fn execute_cli(
 
     let filter = if cli.quiet {
         EnvFilter::new("warn")
+    } else if cli.verbose {
+        EnvFilter::new("debug")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
@@ -405,6 +478,7 @@ async fn execute_cli(
         Commands::Index { .. }
         | Commands::Search { .. }
         | Commands::Stats { .. }
+        | Commands::Diag { .. }
         | Commands::View { .. } => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
@@ -422,15 +496,19 @@ async fn execute_cli(
                     full,
                     force_rebuild,
                     watch,
+                    watch_once,
                     data_dir,
+                    json,
                 } => {
                     run_index_with_data(
                         cli.db.clone(),
                         full,
                         force_rebuild,
                         watch,
+                        watch_once,
                         data_dir,
                         progress,
+                        json,
                     )?;
                 }
                 Commands::Search {
@@ -440,6 +518,9 @@ async fn execute_cli(
                     limit,
                     offset,
                     json,
+                    robot_format,
+                    robot_meta,
+                    display,
                     data_dir,
                     days,
                     today,
@@ -455,6 +536,9 @@ async fn execute_cli(
                         &limit,
                         &offset,
                         &json,
+                        robot_format,
+                        robot_meta,
+                        display,
                         &data_dir,
                         cli.db.clone(),
                         wrap,
@@ -471,6 +555,13 @@ async fn execute_cli(
                 }
                 Commands::Stats { data_dir, json } => {
                     run_stats(&data_dir, cli.db.clone(), json)?;
+                }
+                Commands::Diag {
+                    data_dir,
+                    json,
+                    verbose,
+                } => {
+                    run_diag(&data_dir, cli.db.clone(), json, verbose)?;
                 }
                 Commands::View {
                     path,
@@ -544,6 +635,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Index { .. }) => "index".to_string(),
         Some(Commands::Search { .. }) => "search".to_string(),
         Some(Commands::Stats { .. }) => "stats".to_string(),
+        Some(Commands::Diag { .. }) => "diag".to_string(),
         Some(Commands::View { .. }) => "view".to_string(),
         Some(Commands::Completions { .. }) => "completions".to_string(),
         Some(Commands::Man) => "man".to_string(),
@@ -638,8 +730,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --since DATE      Filter from date (YYYY-MM-DD)".to_string(),
             "    --until DATE      Filter to date (YYYY-MM-DD)".to_string(),
             "  cass stats [--json] [--data-dir DIR]".to_string(),
+            "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
-            "  cass index [--full] [--watch] [--data-dir DIR]".to_string(),
+            "  cass index [--full] [--watch] [--json] [--data-dir DIR]".to_string(),
             "  cass tui [--once] [--data-dir DIR]".to_string(),
             "  cass robot-docs <topic>".to_string(),
             "  cass --robot-help".to_string(),
@@ -664,6 +757,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         RobotTopic::Schemas => vec![
             "schemas:".to_string(),
             "  search: {query:str,limit:int,offset:int,count:int,hits:[{score:f64,agent:str,workspace:str,source_path:str,snippet:str,content:str,title:str,created_at:int?,line_number:int?}]}".to_string(),
+            "  stats: {conversations:int,messages:int,by_agent:[{agent:str,count:int}],top_workspaces:[{workspace:str,count:int}],date_range:{oldest:str?,newest:str?},db_path:str}".to_string(),
+            "  diag: {version:str,platform:{os:str,arch:str},paths:{data_dir:str,db_path:str,index_path:str},database:{exists:bool,size_bytes:int,conversations:int,messages:int},index:{exists:bool,size_bytes:int},connectors:[{name:str,path:str,found:bool}]}".to_string(),
+            "  index: {success:bool,elapsed_ms:int,full:bool,force_rebuild:bool,data_dir:str,db_path:str,conversations:int,messages:int}".to_string(),
             "  error: {error:{code:int,kind:str,message:str,hint:str?,retryable:bool}}".to_string(),
             "  trace: {start_ts:str,end_ts:str,duration_ms:u128,cmd:str,args:[str],exit_code:int,error:?}".to_string(),
         ],
@@ -695,6 +791,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "# Get index statistics".to_string(),
             "  cass stats --json                        # JSON stats".to_string(),
             "  cass stats                               # Human-readable stats".to_string(),
+            "".to_string(),
+            "# Diagnostics".to_string(),
+            "  cass diag --json                         # JSON diagnostic info".to_string(),
+            "  cass diag --verbose                      # Human-readable with sizes".to_string(),
             "".to_string(),
             "# Full workflow".to_string(),
             "  cass index --full                        # index all sessions".to_string(),
@@ -835,6 +935,9 @@ fn run_cli_search(
     limit: &usize,
     offset: &usize,
     json: &bool,
+    robot_format: Option<RobotFormat>,
+    robot_meta: bool,
+    display_format: Option<DisplayFormat>,
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
     wrap: WrapConfig,
@@ -844,6 +947,9 @@ fn run_cli_search(
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
     use std::collections::HashSet;
+
+    // Start timing for robot_meta elapsed_ms
+    let start_time = Instant::now();
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let index_path = index_dir(&data_dir).map_err(|e| CliError {
@@ -884,8 +990,14 @@ fn run_cli_search(
     filters.created_from = time_filter.since;
     filters.created_to = time_filter.until;
 
-    let hits = client
-        .search(query, filters, *limit, *offset)
+    // Determine the effective output format
+    // Priority: robot_format > json flag > display format > default plain
+    let effective_robot = robot_format.or(if *json { Some(RobotFormat::Json) } else { None });
+
+    // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
+    let sparse_threshold = 3; // Threshold for triggering wildcard fallback
+    let result = client
+        .search_with_fallback(query, filters, *limit, *offset, sparse_threshold)
         .map_err(|e| CliError {
             code: 9,
             kind: "search",
@@ -894,26 +1006,21 @@ fn run_cli_search(
             retryable: true,
         })?;
 
-    if *json {
-        let payload = serde_json::json!({
-            "query": query,
-            "limit": limit,
-            "offset": offset,
-            "count": hits.len(),
-            "hits": hits,
-        });
-        let out = serde_json::to_string_pretty(&payload).map_err(|e| CliError {
-            code: 9,
-            kind: "encode-json",
-            message: format!("failed to encode json: {e}"),
-            hint: None,
-            retryable: false,
-        })?;
-        println!("{}", out);
-    } else if hits.is_empty() {
+    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+
+    if let Some(format) = effective_robot {
+        // Robot output mode (JSON)
+        output_robot_results(
+            query, *limit, *offset, &result, format, robot_meta, elapsed_ms,
+        )?;
+    } else if result.hits.is_empty() {
         eprintln!("No results found.");
+    } else if let Some(display) = display_format {
+        // Human-readable display formats
+        output_display_results(&result.hits, display, wrap)?;
     } else {
-        for hit in &hits {
+        // Default plain text output
+        for hit in &result.hits {
             println!("----------------------------------------------------------------");
             println!(
                 "Score: {:.2} | Agent: {} | WS: {}",
@@ -924,6 +1031,166 @@ fn run_cli_search(
             println!("Snippet: {}", apply_wrap(&snippet, wrap));
         }
         println!("----------------------------------------------------------------");
+    }
+
+    Ok(())
+}
+
+/// Output search results in human-readable display format
+fn output_display_results(
+    hits: &[crate::search::query::SearchHit],
+    format: DisplayFormat,
+    wrap: WrapConfig,
+) -> CliResult<()> {
+    match format {
+        DisplayFormat::Table => {
+            // Aligned columns with headers
+            println!("{:<6} {:<12} {:<25} SNIPPET", "SCORE", "AGENT", "WORKSPACE");
+            println!("{}", "-".repeat(80));
+            for hit in hits {
+                let workspace = truncate_start(&hit.workspace, 24);
+                let snippet = hit.snippet.replace('\n', " ");
+                let snippet_display = truncate_end(&snippet, 50);
+                println!(
+                    "{:<6.2} {:<12} {:<25} {}",
+                    hit.score, hit.agent, workspace, snippet_display
+                );
+            }
+            println!("\n{} results", hits.len());
+        }
+        DisplayFormat::Lines => {
+            // One-liner per result
+            for hit in hits {
+                let snippet = hit.snippet.replace('\n', " ");
+                let snippet_short = truncate_end(&snippet, 60);
+                println!(
+                    "[{:.1}] {} | {} | {}",
+                    hit.score, hit.agent, hit.source_path, snippet_short
+                );
+            }
+        }
+        DisplayFormat::Markdown => {
+            // Markdown with headers and code blocks
+            println!("# Search Results\n");
+            println!("Found **{}** results.\n", hits.len());
+            for (i, hit) in hits.iter().enumerate() {
+                println!("## {}. {} (score: {:.2})\n", i + 1, hit.agent, hit.score);
+                println!("- **Workspace**: `{}`", hit.workspace);
+                println!("- **Path**: `{}`", hit.source_path);
+                if let Some(ts) = hit.created_at {
+                    let dt = chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    println!("- **Created**: {}", dt);
+                }
+                let snippet = apply_wrap(&hit.snippet, wrap);
+                println!("\n```\n{}\n```\n", snippet);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Output search results in robot-friendly format
+fn output_robot_results(
+    query: &str,
+    limit: usize,
+    offset: usize,
+    result: &crate::search::query::SearchResult,
+    format: RobotFormat,
+    include_meta: bool,
+    elapsed_ms: u64,
+) -> CliResult<()> {
+    match format {
+        RobotFormat::Json => {
+            // Pretty-printed JSON (backward compatible)
+            let mut payload = serde_json::json!({
+                "query": query,
+                "limit": limit,
+                "offset": offset,
+                "count": result.hits.len(),
+                "hits": result.hits,
+            });
+
+            // Add extended metadata if requested
+            if include_meta && let serde_json::Value::Object(ref mut map) = payload {
+                map.insert(
+                    "_meta".to_string(),
+                    serde_json::json!({
+                        "elapsed_ms": elapsed_ms,
+                        "wildcard_fallback": result.wildcard_fallback,
+                        "cache_stats": {
+                            "hits": result.cache_stats.cache_hits,
+                            "misses": result.cache_stats.cache_miss,
+                            "shortfall": result.cache_stats.cache_shortfall,
+                        }
+                    }),
+                );
+            }
+
+            let out = serde_json::to_string_pretty(&payload).map_err(|e| CliError {
+                code: 9,
+                kind: "encode-json",
+                message: format!("failed to encode json: {e}"),
+                hint: None,
+                retryable: false,
+            })?;
+            println!("{}", out);
+        }
+        RobotFormat::Jsonl => {
+            // JSONL: one object per line, optional _meta header
+            if include_meta {
+                let meta = serde_json::json!({
+                    "_meta": {
+                        "query": query,
+                        "limit": limit,
+                        "offset": offset,
+                        "count": result.hits.len(),
+                        "elapsed_ms": elapsed_ms,
+                        "wildcard_fallback": result.wildcard_fallback,
+                        "cache_stats": {
+                            "hits": result.cache_stats.cache_hits,
+                            "misses": result.cache_stats.cache_miss,
+                            "shortfall": result.cache_stats.cache_shortfall,
+                        }
+                    }
+                });
+                println!("{}", serde_json::to_string(&meta).unwrap_or_default());
+            }
+            // One hit per line
+            for hit in &result.hits {
+                println!("{}", serde_json::to_string(hit).unwrap_or_default());
+            }
+        }
+        RobotFormat::Compact => {
+            // Single-line compact JSON
+            let mut payload = serde_json::json!({
+                "query": query,
+                "limit": limit,
+                "offset": offset,
+                "count": result.hits.len(),
+                "hits": result.hits,
+            });
+
+            if include_meta && let serde_json::Value::Object(ref mut map) = payload {
+                map.insert(
+                    "_meta".to_string(),
+                    serde_json::json!({
+                        "elapsed_ms": elapsed_ms,
+                        "wildcard_fallback": result.wildcard_fallback,
+                    }),
+                );
+            }
+
+            let out = serde_json::to_string(&payload).map_err(|e| CliError {
+                code: 9,
+                kind: "encode-json",
+                message: format!("failed to encode json: {e}"),
+                hint: None,
+                retryable: false,
+            })?;
+            println!("{}", out);
+        }
     }
 
     Ok(())
@@ -1062,6 +1329,208 @@ fn run_stats(
     Ok(())
 }
 
+fn run_diag(
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    json: bool,
+    verbose: bool,
+) -> CliResult<()> {
+    use rusqlite::Connection;
+    use std::fs;
+
+    let version = env!("CARGO_PKG_VERSION");
+    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let index_path = data_dir.join("tantivy_index");
+
+    // Check database existence and get stats
+    let (db_exists, db_size, conversation_count, message_count) = if db_path.exists() {
+        let size = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        let (convs, msgs) = if let Ok(conn) = Connection::open(&db_path) {
+            let convs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+                .unwrap_or(0);
+            let msgs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+                .unwrap_or(0);
+            (convs, msgs)
+        } else {
+            (0, 0)
+        };
+        (true, size, convs, msgs)
+    } else {
+        (false, 0, 0, 0)
+    };
+
+    // Check index existence
+    let (index_exists, index_size) = if index_path.exists() {
+        let size = fs_dir_size(&index_path);
+        (true, size)
+    } else {
+        (false, 0)
+    };
+
+    // Agent search paths - compute path once, then check existence
+    let home = dirs::home_dir().unwrap_or_default();
+    let config_dir = dirs::config_dir().unwrap_or_default();
+
+    let codex_path = home.join(".codex/sessions");
+    let claude_path = home.join(".claude/projects");
+    let cline_path = config_dir.join("Code/User/globalStorage/saoudrizwan.claude-dev");
+    let gemini_path = home.join(".gemini/tmp");
+    let opencode_path = home.join(".opencode");
+    let amp_path = config_dir.join("Code/User/globalStorage/sourcegraph.amp");
+
+    let agent_paths: Vec<(&str, &std::path::Path, bool)> = vec![
+        ("codex", &codex_path, codex_path.exists()),
+        ("claude", &claude_path, claude_path.exists()),
+        ("cline", &cline_path, cline_path.exists()),
+        ("gemini", &gemini_path, gemini_path.exists()),
+        ("opencode", &opencode_path, opencode_path.exists()),
+        ("amp", &amp_path, amp_path.exists()),
+    ];
+
+    let platform = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
+    if json {
+        let payload = serde_json::json!({
+            "version": version,
+            "platform": { "os": platform, "arch": arch },
+            "paths": {
+                "data_dir": data_dir.display().to_string(),
+                "db_path": db_path.display().to_string(),
+                "index_path": index_path.display().to_string(),
+            },
+            "database": {
+                "exists": db_exists,
+                "size_bytes": db_size,
+                "conversations": conversation_count,
+                "messages": message_count,
+            },
+            "index": {
+                "exists": index_exists,
+                "size_bytes": index_size,
+            },
+            "connectors": agent_paths.iter().map(|(name, path, exists)| {
+                serde_json::json!({
+                    "name": name,
+                    "path": path.display().to_string(),
+                    "found": exists,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        println!("CASS Diagnostic Report");
+        println!("======================");
+        println!();
+        println!("Version: {}", version);
+        println!("Platform: {} ({})", platform, arch);
+        println!();
+        println!("Paths:");
+        println!("  Data directory: {}", data_dir.display());
+        println!("  Database: {}", db_path.display());
+        println!("  Tantivy index: {}", index_path.display());
+        println!();
+        println!("Database Status:");
+        if db_exists {
+            println!("  Status: OK");
+            if verbose {
+                println!("  Size: {}", format_bytes(db_size));
+            }
+            println!("  Conversations: {}", conversation_count);
+            println!("  Messages: {}", message_count);
+        } else {
+            println!("  Status: NOT FOUND");
+            println!("  Hint: Run 'cass index --full' to create the database");
+        }
+        println!();
+        println!("Index Status:");
+        if index_exists {
+            println!("  Status: OK");
+            if verbose {
+                println!("  Size: {}", format_bytes(index_size));
+            }
+        } else {
+            println!("  Status: NOT FOUND");
+            println!("  Hint: Run 'cass index --full' to create the index");
+        }
+        println!();
+        println!("Connector Search Paths:");
+        for (name, path, exists) in &agent_paths {
+            let status = if *exists { "✓" } else { "✗" };
+            println!("  {} {}: {}", status, name, path.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn fs_dir_size(path: &std::path::Path) -> u64 {
+    if !path.is_dir() {
+        return std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    }
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| {
+                    let p = e.path();
+                    if p.is_dir() {
+                        fs_dir_size(&p)
+                    } else {
+                        std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
+                    }
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Truncate a string from the start, keeping the last `max_chars` characters.
+/// UTF-8 safe. Adds "..." prefix if truncated.
+fn truncate_start(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        s.to_string()
+    } else {
+        let skip = char_count - (max_chars - 3); // -3 for "..."
+        format!("...{}", s.chars().skip(skip).collect::<String>())
+    }
+}
+
+/// Truncate a string from the end, keeping the first `max_chars` characters.
+/// UTF-8 safe. Adds "..." suffix if truncated.
+fn truncate_end(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        s.to_string()
+    } else {
+        let take = max_chars - 3; // -3 for "..."
+        format!("{}...", s.chars().take(take).collect::<String>())
+    }
+}
+
 fn run_view(path: &PathBuf, line: Option<usize>, context: usize, json: bool) -> CliResult<()> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
@@ -1191,6 +1660,7 @@ fn spawn_background_indexer(
             full: false,
             force_rebuild: false,
             watch: true,
+            watch_once_paths: read_watch_once_paths_env(),
             db_path,
             data_dir,
             progress,
@@ -1201,36 +1671,59 @@ fn spawn_background_indexer(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
     full: bool,
     force_rebuild: bool,
     watch: bool,
+    watch_once: Option<Vec<PathBuf>>,
     data_dir_override: Option<PathBuf>,
     progress: ProgressResolved,
+    json: bool,
 ) -> CliResult<()> {
+    use rusqlite::Connection;
+    use std::time::Instant;
+
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let watch_once_paths = watch_once
+        .filter(|paths| !paths.is_empty())
+        .or_else(read_watch_once_paths_env);
     let opts = IndexOptions {
         full,
         force_rebuild,
         watch,
-        db_path,
-        data_dir,
+        watch_once_paths: watch_once_paths.clone(),
+        db_path: db_path.clone(),
+        data_dir: data_dir.clone(),
         progress: None,
     };
-    let spinner = match progress {
-        ProgressResolved::Bars => Some(indicatif::ProgressBar::new_spinner()),
-        ProgressResolved::Plain => None,
-        ProgressResolved::None => None,
+    let spinner = if !json {
+        match progress {
+            ProgressResolved::Bars => Some(indicatif::ProgressBar::new_spinner()),
+            ProgressResolved::Plain => None,
+            ProgressResolved::None => None,
+        }
+    } else {
+        None
     };
     if let Some(pb) = &spinner {
         pb.set_message(if full { "index --full" } else { "index" });
         pb.enable_steady_tick(Duration::from_millis(120));
-    } else if matches!(progress, ProgressResolved::Plain) {
-        eprintln!("index starting (full={}, watch={})", full, watch);
+    } else if !json && matches!(progress, ProgressResolved::Plain) {
+        eprintln!(
+            "index starting (full={}, watch={}, watch_once={})",
+            full,
+            watch,
+            watch_once_paths
+                .as_ref()
+                .map(|p| p.len())
+                .unwrap_or_default()
+        );
     }
 
+    let start = Instant::now();
     let res = indexer::run_index(opts).map_err(|e| {
         let chain = e
             .chain()
@@ -1245,14 +1738,54 @@ fn run_index_with_data(
             retryable: true,
         }
     });
+    let elapsed_ms = start.elapsed().as_millis();
 
     if let Err(err) = &res {
-        eprintln!("index debug error: {err:?}");
+        if json {
+            let payload = serde_json::json!({
+                "success": false,
+                "error": err.message,
+                "elapsed_ms": elapsed_ms,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
+        } else {
+            eprintln!("index debug error: {err:?}");
+        }
+    } else if json {
+        // Get stats after successful indexing
+        let (conversations, messages) = if let Ok(conn) = Connection::open(&db_path) {
+            let convs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+                .unwrap_or(0);
+            let msgs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+                .unwrap_or(0);
+            (convs, msgs)
+        } else {
+            (0, 0)
+        };
+        let payload = serde_json::json!({
+            "success": true,
+            "elapsed_ms": elapsed_ms,
+            "full": full,
+            "force_rebuild": force_rebuild,
+            "data_dir": data_dir.display().to_string(),
+            "db_path": db_path.display().to_string(),
+            "conversations": conversations,
+            "messages": messages,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
     }
 
     if let Some(pb) = spinner {
         pb.finish_and_clear();
-    } else if matches!(progress, ProgressResolved::Plain) {
+    } else if !json && matches!(progress, ProgressResolved::Plain) {
         eprintln!("index completed");
     }
 
