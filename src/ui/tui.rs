@@ -5129,8 +5129,9 @@ pub fn run_tui(
                                                 if active_pane < pane_scroll_offset {
                                                     pane_scroll_offset = active_pane;
                                                 }
-                                                focus_flash_until =
-                                                    Some(Instant::now() + Duration::from_millis(220));
+                                                focus_flash_until = Some(
+                                                    Instant::now() + Duration::from_millis(220),
+                                                );
                                                 cached_detail = None;
                                                 detail_scroll = 0;
                                             }
@@ -5153,8 +5154,9 @@ pub fn run_tui(
                                                         pane_scroll_offset = active_pane
                                                             .saturating_sub(MAX_VISIBLE_PANES - 1);
                                                     }
-                                                    focus_flash_until =
-                                                        Some(Instant::now() + Duration::from_millis(220));
+                                                    focus_flash_until = Some(
+                                                        Instant::now() + Duration::from_millis(220),
+                                                    );
                                                     cached_detail = None;
                                                     detail_scroll = 0;
                                                 } else {
