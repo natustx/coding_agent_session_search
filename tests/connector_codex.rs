@@ -500,3 +500,382 @@ fn codex_connector_handles_empty_sessions() {
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
 }
+
+/// Test integer (milliseconds) timestamp format
+#[test]
+fn codex_connector_parses_millis_timestamp() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/12/03");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-millis.jsonl");
+
+    // Timestamps as i64 milliseconds instead of ISO-8601 strings
+    let sample = r#"{"timestamp":1700000000000,"type":"session_meta","payload":{"id":"millis-test","cwd":"/millis"}}
+{"timestamp":1700000001000,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"millis timestamp test"}]}}
+{"timestamp":1700000002000,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"response with millis"}]}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let c = &convs[0];
+    assert_eq!(c.messages.len(), 2);
+    // Verify timestamps were parsed from i64 millis
+    // started_at comes from session_meta timestamp (1700000000000)
+    assert_eq!(c.started_at, Some(1700000000000));
+    // ended_at comes from the last message timestamp (1700000002000)
+    assert_eq!(c.ended_at, Some(1700000002000));
+}
+
+/// Test tool_use blocks in content are flattened properly
+#[test]
+fn codex_connector_flattens_tool_use_blocks() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/12/04");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-tools.jsonl");
+
+    let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"tool-test","cwd":"/tools"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"read a file"}]}}
+{"timestamp":"2025-09-30T15:42:43.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"Let me read that file"},{"type":"tool_use","name":"Read","input":{"file_path":"/test/file.rs"}}]}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let c = &convs[0];
+    assert_eq!(c.messages.len(), 2);
+
+    // Assistant message should contain flattened tool_use
+    let assistant = &c.messages[1];
+    assert!(assistant.content.contains("Let me read that file"));
+    assert!(assistant.content.contains("[Tool: Read"));
+    assert!(assistant.content.contains("/test/file.rs"));
+}
+
+/// Test missing cwd in session_meta results in None workspace
+#[test]
+fn codex_connector_handles_missing_cwd() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/12/05");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-no-cwd.jsonl");
+
+    // session_meta without cwd field
+    let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"no-cwd","cli_version":"0.42.0"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"test without cwd"}]}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let c = &convs[0];
+    assert!(
+        c.workspace.is_none(),
+        "workspace should be None when cwd missing"
+    );
+}
+
+/// Test files without rollout- prefix are ignored
+#[test]
+fn codex_connector_ignores_non_rollout_files() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/12/06");
+    fs::create_dir_all(&sessions).unwrap();
+
+    // Valid rollout file
+    let rollout = sessions.join("rollout-valid.jsonl");
+    let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"valid","cwd":"/test"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"valid"}]}}
+"#;
+    fs::write(&rollout, sample).unwrap();
+
+    // Non-rollout files that should be ignored
+    let other1 = sessions.join("session-123.jsonl");
+    let other2 = sessions.join("backup.json");
+    let other3 = sessions.join("config.jsonl");
+    fs::write(&other1, sample).unwrap();
+    fs::write(&other2, sample).unwrap();
+    fs::write(&other3, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    // Only the rollout- prefixed file should be processed
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].external_id, Some("rollout-valid".to_string()));
+}
+
+/// Test legacy JSON with missing optional fields
+#[test]
+fn codex_connector_handles_legacy_json_missing_session() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/12/07");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-minimal.json");
+
+    // Minimal legacy format without session object
+    let sample = r#"{
+        "items": [
+            {
+                "role": "user",
+                "content": "minimal legacy message"
+            }
+        ]
+    }"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let c = &convs[0];
+    assert!(c.workspace.is_none());
+    assert_eq!(c.messages.len(), 1);
+    assert!(c.messages[0].content.contains("minimal legacy message"));
+}
+
+/// Test title fallback to first message when no user message exists
+#[test]
+fn codex_connector_title_fallback_to_first_message() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/12/08");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-no-user.jsonl");
+
+    // Only assistant messages, no user message
+    let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"no-user","cwd":"/test"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"Assistant first line\nSecond line"}]}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let c = &convs[0];
+    // Title should fallback to first line of first message
+    assert_eq!(c.title, Some("Assistant first line".to_string()));
+}
+
+/// Test deeply nested directory structure
+#[test]
+fn codex_connector_handles_nested_directories() {
+    let dir = TempDir::new().unwrap();
+    let deep_sessions = dir.path().join("sessions/2025/12/09/sub1/sub2");
+    fs::create_dir_all(&deep_sessions).unwrap();
+    let file = deep_sessions.join("rollout-nested.jsonl");
+
+    let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"nested","cwd":"/nested"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"deeply nested"}]}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+    assert!(convs[0].source_path.to_string_lossy().contains("sub2"));
+}
+
+/// Test turn_aborted event is filtered out
+#[test]
+fn codex_connector_filters_turn_aborted() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/12/10");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-aborted.jsonl");
+
+    let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"test-id","cwd":"/test"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"test"}]}}
+{"timestamp":"2025-09-30T15:42:37.000Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"user cancelled"}}
+{"timestamp":"2025-09-30T15:42:38.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"response"}]}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let c = &convs[0];
+    // Should only have 2 messages (user, assistant) - turn_aborted filtered
+    assert_eq!(c.messages.len(), 2);
+    for msg in &c.messages {
+        assert!(!msg.content.contains("turn_aborted"));
+    }
+}
+
+/// Test long title is truncated to 100 chars
+#[test]
+fn codex_connector_truncates_long_title() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/12/11");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-long-title.jsonl");
+
+    let long_text = "A".repeat(200);
+    let sample = format!(
+        r#"{{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{{"id":"long","cwd":"/test"}}}}
+{{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{long_text}"}}]}}}}
+"#
+    );
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let c = &convs[0];
+    assert!(c.title.is_some());
+    assert_eq!(c.title.as_ref().unwrap().len(), 100);
+}
+
+/// Test source_path matches actual file path
+#[test]
+fn codex_connector_sets_source_path() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/12/12");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-source-path.jsonl");
+
+    let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"path-test","cwd":"/test"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"test source path"}]}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let c = &convs[0];
+    assert_eq!(c.source_path, file);
+}
+
+/// Test metadata indicates correct source format
+#[test]
+fn codex_connector_metadata_indicates_format() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/12/13");
+    fs::create_dir_all(&sessions).unwrap();
+
+    // Create both JSONL and JSON files
+    let jsonl_file = sessions.join("rollout-jsonl.jsonl");
+    let json_file = sessions.join("rollout-json.json");
+
+    let jsonl_sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"jsonl","cwd":"/test"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"jsonl format"}]}}
+"#;
+    fs::write(&jsonl_file, jsonl_sample).unwrap();
+
+    let json_sample = r#"{"session":{"id":"json","cwd":"/test"},"items":[{"role":"user","content":"json format"}]}"#;
+    fs::write(&json_file, json_sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 2);
+
+    // Find each conversation and verify metadata
+    let jsonl_conv = convs.iter().find(|c| c.source_path == jsonl_file).unwrap();
+    let json_conv = convs.iter().find(|c| c.source_path == json_file).unwrap();
+
+    assert_eq!(
+        jsonl_conv.metadata.get("source").and_then(|v| v.as_str()),
+        Some("rollout")
+    );
+    assert_eq!(
+        json_conv.metadata.get("source").and_then(|v| v.as_str()),
+        Some("rollout_json")
+    );
+}

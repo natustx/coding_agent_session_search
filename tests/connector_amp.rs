@@ -416,13 +416,7 @@ fn amp_extracts_external_id() {
         .iter()
         .find(|c| c.source_path.to_string_lossy().contains("thread-id1"))
         .unwrap();
-    // Filename fallback happens if "id" field is missing?
-    // Actually code says: path.file_stem() OR val.get("id").
-    // Wait, OR_ELSE is lazy. So if file_stem exists, it uses that.
-    // Let's check source:
-    // let external_id = path.file_stem()... or_else(|| val.get("id")...)
-    // So file stem ALWAYS wins if present.
-
+    // external_id comes from file stem (takes priority over JSON "id" field)
     assert_eq!(c1.external_id, Some("thread-id1".to_string()));
 
     let c2 = convs
@@ -503,8 +497,12 @@ fn amp_extracts_author_field() {
     assert_eq!(convs.len(), 1);
 
     let msgs = &convs[0].messages;
-    // Check if author fields are extracted (depends on implementation)
     assert_eq!(msgs.len(), 3);
+
+    // Verify author extraction: "author" and "sender" are recognized, "model" is not
+    assert_eq!(msgs[0].author, Some("user@example.com".to_string()));
+    assert_eq!(msgs[1].author, Some("claude-3".to_string()));
+    assert_eq!(msgs[2].author, None); // "model" is not a recognized author field
 }
 
 /// Test handling of empty directory
@@ -777,10 +775,12 @@ fn amp_skips_json_without_messages() {
 
     // Should only have the valid one
     assert_eq!(convs.len(), 1);
-    assert!(convs[0]
-        .source_path
-        .to_string_lossy()
-        .contains("thread-valid"));
+    assert!(
+        convs[0]
+            .source_path
+            .to_string_lossy()
+            .contains("thread-valid")
+    );
 }
 
 /// Test camelCase timestamp field (createdAt)
@@ -930,8 +930,10 @@ fn amp_skips_empty_content_conversations() {
 
     // Only the valid one should be included
     assert_eq!(convs.len(), 1);
-    assert!(convs[0]
-        .source_path
-        .to_string_lossy()
-        .contains("thread-hasvalid"));
+    assert!(
+        convs[0]
+            .source_path
+            .to_string_lossy()
+            .contains("thread-hasvalid")
+    );
 }
