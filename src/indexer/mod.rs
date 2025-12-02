@@ -157,6 +157,7 @@ pub fn run_index(
             }
 
             // Update discovered agents count immediately when detected
+            // This gives fast UI feedback during the discovery phase
             if let Some(p) = progress_ref {
                 p.discovered_agents.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut names) = p.discovered_agent_names.lock() {
@@ -178,6 +179,8 @@ pub fn run_index(
                     Some((name, convs))
                 }
                 Err(e) => {
+                    // Note: agent was counted as discovered but scan failed
+                    // This is acceptable as detection succeeded (agent exists)
                     tracing::warn!("scan failed for {}: {}", name, e);
                     None
                 }
