@@ -6424,7 +6424,7 @@ fn run_timeline(
     use std::collections::HashMap;
 
     let data_root = data_dir.clone().unwrap_or_else(default_data_dir);
-    let db_path = db_override.unwrap_or_else(|| data_root.join("cass.db"));
+    let db_path = db_override.unwrap_or_else(|| data_root.join("agent_search.db"));
 
     if !db_path.exists() {
         return Err(CliError {
