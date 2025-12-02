@@ -123,6 +123,9 @@ pub fn run_index(
     let mut pending_batches = Vec::new();
     if let Some(p) = &opts.progress {
         p.phase.store(1, Ordering::Relaxed); // Scanning
+        // Seed totals to avoid 0/0 progress display; will be updated during scanning.
+        p.total.store(1, Ordering::Relaxed);
+        p.current.store(0, Ordering::Relaxed);
     }
 
     for (name, conn) in &connectors {
