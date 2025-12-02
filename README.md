@@ -26,6 +26,33 @@ install.ps1 -EasyMode -Verify
 
 ---
 
+## 📸 Screenshots
+
+<div align="center">
+
+### Search Results Across All Your Agents
+*Three-pane layout: filter bar, results list with color-coded agents (Claude, Codex, Gemini, etc.), and syntax-highlighted detail preview*
+
+<img src="screenshots/screenshot_01.webp" alt="Main TUI showing search results across multiple coding agents" width="800">
+
+---
+
+### Rich Conversation Detail View
+*Full conversation rendering with markdown formatting, code blocks, headers, and structured content*
+
+<img src="screenshots/screenshot_02.webp" alt="Detail view showing formatted conversation content" width="800">
+
+---
+
+### Quick Start & Keyboard Reference
+*Built-in help screen (press `F1` or `?`) with all shortcuts, filters, modes, and navigation tips*
+
+<img src="screenshots/screenshot_03.webp" alt="Help screen showing keyboard shortcuts and features" width="500">
+
+</div>
+
+---
+
 ## ✨ Key Features
 
 ### ⚡ Instant Search (Sub-60ms Latency)
@@ -124,7 +151,15 @@ classDiagram
     classDef pastelEdge fill:#e6f7ff,stroke:#9bd5f5,color:#0f3a4d;
     class Connector pastel
     class NormalizedConversation pastelEdge
-    class CodexConnector,ClineConnector,ClaudeCodeConnector,GeminiConnector,OpenCodeConnector,AmpConnector,CursorConnector,ChatGptConnector,AiderConnector pastel
+    class CodexConnector pastel
+    class ClineConnector pastel
+    class ClaudeCodeConnector pastel
+    class GeminiConnector pastel
+    class OpenCodeConnector pastel
+    class AmpConnector pastel
+    class CursorConnector pastel
+    class ChatGptConnector pastel
+    class AiderConnector pastel
 ```
 
 - **Polymorphic Scanning**: The indexer runs connector factories in parallel via rayon, creating fresh `Box<dyn Connector>` instances that are unaware of each other's underlying file formats (JSONL, SQLite, specialized JSON).
