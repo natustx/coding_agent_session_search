@@ -498,16 +498,43 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     let mut sub_seen = false;
     let mut rewrote = false;
 
-    let push_global = |arg: String, globals: &mut Vec<String>, rewrote: &mut bool| {
-        globals.push(arg);
-        *rewrote = true;
+    // Global flags that take a value via separate argument (--flag VALUE)
+    let global_with_value = |s: &str| {
+        matches!(
+            s,
+            "--color" | "--progress" | "--wrap" | "--db" | "--trace-file"
+        )
+    };
+    // Global flags that take a value via `=` syntax or are standalone
+    let is_global = |s: &str| {
+        s == "--color"
+            || s.starts_with("--color=")
+            || s == "--progress"
+            || s.starts_with("--progress=")
+            || s == "--wrap"
+            || s.starts_with("--wrap=")
+            || s == "--nowrap"
+            || s == "--db"
+            || s.starts_with("--db=")
+            || s == "--quiet"
+            || s == "-q"
+            || s == "--verbose"
+            || s == "-v"
+            || s == "--trace-file"
+            || s.starts_with("--trace-file=")
+            || s == "--robot-help"
     };
 
-    for arg in raw.iter().skip(1) {
+    let args: Vec<_> = raw.iter().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+
         // Handle --robot-docs and --robot-docs=topic
-        if arg == "--robot-docs" {
+        if *arg == "--robot-docs" {
             rest.push("robot-docs".into());
             rewrote = true;
+            i += 1;
             continue;
         }
         if let Some(topic) = arg.strip_prefix("--robot-docs=") {
@@ -516,30 +543,21 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
                 rest.push(topic.to_string());
             }
             rewrote = true;
+            i += 1;
             continue;
         }
 
-        let is_global = |s: &str| {
-            s == "--color"
-                || s.starts_with("--color=")
-                || s == "--progress"
-                || s.starts_with("--progress=")
-                || s == "--wrap"
-                || s.starts_with("--wrap=")
-                || s == "--nowrap"
-                || s == "--db"
-                || s.starts_with("--db=")
-                || s == "--quiet"
-                || s == "-q"
-                || s == "--verbose"
-                || s == "-v"
-                || s == "--trace-file"
-                || s.starts_with("--trace-file=")
-                || s == "--robot-help"
-        };
-
         if is_global(arg) {
-            push_global(arg.to_string(), &mut globals, &mut rewrote);
+            globals.push(arg.to_string());
+            rewrote = true;
+            // If this global takes a value and doesn't use `=` syntax, consume the next arg
+            if global_with_value(arg) && !arg.contains('=') {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    globals.push(args[i + 1].to_string());
+                    i += 1;
+                }
+            }
+            i += 1;
             continue;
         }
 
@@ -547,6 +565,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             sub_seen = true;
         }
         rest.push(arg.to_string());
+        i += 1;
     }
 
     let mut normalized = Vec::with_capacity(1 + globals.len() + rest.len());

@@ -212,13 +212,63 @@ Mapping cheat‑sheet
 - **File reservation `reason`**: `bd-###`
 - **Commit messages (optional)**: include `bd-###` for traceability
 
+Pitfalls to avoid
+- Don't create or manage tasks in Mail; treat Beads as the single task queue.
+- Always include `bd-###` in message `thread_id` to avoid ID drift across tools.
+
 Event mirroring (optional automation)
 - On `bd update --status blocked`, send a high‑importance Mail message in thread `bd-###` describing the blocker.
 - On Mail "ACK overdue" for a critical decision, add a Beads label (e.g., `needs-ack`) or bump priority to surface it in `bd ready`.
 
-Pitfalls to avoid
-- Don't create or manage tasks in Mail; treat Beads as the single task queue.
-- Always include `bd-###` in message `thread_id` to avoid ID drift across tools.
+---
+
+## Robot Interface (CLI) — Automation Guide
+
+`cass` is designed to be driven by AI agents. It supports fuzzy command recovery, structured JSON outputs, and helpful error messages to ensure you can always recover from mistakes without human intervention.
+
+### Best Practices for Agents
+
+1.  **Use Robot Mode:** Always pass `--robot` (or `--json`) to get structured output. This suppresses INFO logs on stderr and ensures stdout is pure JSON.
+2.  **Trust the Error Messages:** If a command fails, read the JSON error output. It includes `examples`, `hint`, and even a `normalized_attempt` if `cass` tried to guess your intent.
+3.  **Use `cass --robot-help`:** This command outputs a "Contract v1" document optimized for LLM consumption, listing all commands and schemas.
+
+### Fuzzy Command Recovery
+
+If you make a syntax error (e.g., typo a flag, forget a subcommand), `cass` attempts to infer your intent instead of just failing.
+
+*   **Implicit Search:** `cass "my query"` -> `cass search "my query"`
+*   **Flag Typos:** `cass search --limit=5` (missing space) -> `cass search --limit 5`
+*   **Flag Spelling:** `cass search --agnt codex` -> `cass search --agent codex`
+
+If `cass` auto-corrects your command, it will print a warning to stderr:
+`WARN: Auto-corrected command: Corrected typo '--agnt' to '--agent'`
+
+### Structured Error Handling
+
+When `cass` cannot execute a command, it returns a JSON error object to stderr (and non-zero exit code).
+
+**Example Error Output:**
+```json
+{
+  "error": {
+    "code": 2,
+    "kind": "usage",
+    "message": "Could not parse arguments",
+    "hint": "Check flags syntax (e.g. --limit 5 not limit=5)",
+    "retryable": false,
+    "examples": [
+      "cass --robot-help",
+      "cass search \"query\" --robot --limit 5"
+    ]
+  }
+}
+```
+
+*   **code**: Exit code (2=Usage, 3=Missing Index, 9=Unknown).
+*   **kind**: Error category string.
+*   **message**: Human-readable description.
+*   **hint**: Specific suggestion for fixing the issue.
+*   **retryable**: If `true`, you can likely retry the exact same command (e.g., transient lock).
 
 ---
 
