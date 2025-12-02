@@ -301,6 +301,9 @@ pub enum Commands {
         /// Output as JSON (`{"healthy": bool, "latency_ms": N}`)
         #[arg(long)]
         json: bool,
+        /// Staleness threshold in seconds (default: 300)
+        #[arg(long, default_value = "300")]
+        stale_threshold: u64,
     },
 }
 
@@ -1556,8 +1559,8 @@ async fn execute_cli(
                 Commands::Introspect { json } => {
                     run_introspect(json)?;
                 }
-                Commands::Health { data_dir, json } => {
-                    run_health(&data_dir, cli.db.clone(), json)?;
+                Commands::Health { data_dir, json, stale_threshold } => {
+                    run_health(&data_dir, cli.db.clone(), json, stale_threshold)?;
                 }
                 _ => {}
             }
