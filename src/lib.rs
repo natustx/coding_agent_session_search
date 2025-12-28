@@ -6285,6 +6285,16 @@ fn run_export(
             continue;
         }
         if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+            // Skip internal message types (file snapshots, etc.)
+            if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
+                if msg_type.contains("snapshot")
+                    || msg_type == "file-history-snapshot"
+                    || msg_type == "isSnapshotUpdate"
+                {
+                    continue;
+                }
+            }
+
             if let Some(ts) = msg.get("timestamp").and_then(|t| t.as_i64()) {
                 if session_start.is_none() || ts < session_start.unwrap() {
                     session_start = Some(ts);
@@ -6386,14 +6396,40 @@ fn format_as_markdown(
     md.push_str("\n---\n\n");
 
     for msg in messages {
+        let content = extract_text_content(msg);
         let role = extract_role(msg);
+
+        // Check if this message has any displayable content
+        let has_tool_content = include_tools && {
+            let content_val = msg
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .or_else(|| msg.get("content"));
+            content_val
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter().any(|b| {
+                        matches!(
+                            b.get("type").and_then(|t| t.as_str()),
+                            Some("tool_use") | Some("tool_result")
+                        )
+                    })
+                })
+                .unwrap_or(false)
+        };
+
+        // Skip messages with no content (unless they have tool content when include_tools is set)
+        if content.is_empty() && !has_tool_content {
+            continue;
+        }
+
         match role.as_str() {
             "user" => md.push_str("## 👤 User\n\n"),
             "assistant" => md.push_str("## 🤖 Assistant\n\n"),
+            "system" => md.push_str("## ⚙️ System\n\n"),
             _ => md.push_str(&format!("## {}\n\n", role)),
         }
 
-        let content = extract_text_content(msg);
         if !content.is_empty() {
             md.push_str(&content);
             md.push_str("\n\n");
@@ -6497,13 +6533,29 @@ fn format_as_html(
 <head>
     <meta charset="UTF-8">
     <title>{title_str}</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         body {{ font-family: system-ui, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f5f5f5; }}
         .message {{ background: white; border-radius: 8px; padding: 16px; margin: 12px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
         .user {{ border-left: 4px solid #2563eb; }}
         .assistant {{ border-left: 4px solid #16a34a; }}
+        .system {{ border-left: 4px solid #9333ea; background: #faf5ff; }}
+        details.message {{ cursor: pointer; }}
+        details.message summary {{ font-weight: bold; color: #374151; margin-bottom: 8px; list-style: none; }}
+        details.message summary::-webkit-details-marker {{ display: none; }}
+        details.message summary::before {{ content: '▶ '; font-size: 0.8em; }}
+        details.message[open] summary::before {{ content: '▼ '; }}
         .role {{ font-weight: bold; color: #374151; margin-bottom: 8px; }}
-        .content {{ white-space: pre-wrap; line-height: 1.6; }}
+        .content {{ line-height: 1.6; }}
+        .content pre {{ background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: 6px; overflow-x: auto; }}
+        .content code {{ background: #e5e7eb; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }}
+        .content pre code {{ background: none; padding: 0; }}
+        .content h1, .content h2, .content h3 {{ margin-top: 1em; margin-bottom: 0.5em; }}
+        .content ul, .content ol {{ padding-left: 1.5em; }}
+        .content blockquote {{ border-left: 3px solid #d1d5db; margin: 1em 0; padding-left: 1em; color: #6b7280; }}
+        .content table {{ border-collapse: collapse; width: 100%; margin: 1em 0; }}
+        .content th, .content td {{ border: 1px solid #e5e7eb; padding: 8px; text-align: left; }}
+        .content th {{ background: #f9fafb; }}
         .tool {{ background: #f3f4f6; padding: 8px; border-radius: 4px; font-family: monospace; font-size: 0.9em; margin: 8px 0; }}
         h1 {{ color: #1f2937; }}
         .meta {{ color: #6b7280; font-size: 0.9em; }}
@@ -6516,8 +6568,34 @@ fn format_as_html(
     );
 
     for msg in messages {
+        let content = extract_text_content(msg);
         let role = extract_role(msg);
-        let role_class = if role == "user" { "user" } else { "assistant" };
+
+        // Check if this message has any displayable content
+        let has_tool_content = include_tools && {
+            let content_val = msg
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .or_else(|| msg.get("content"));
+            content_val
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                })
+                .unwrap_or(false)
+        };
+
+        // Skip messages with no content (unless they have tool content when include_tools is set)
+        if content.is_empty() && !has_tool_content {
+            continue;
+        }
+
+        let role_class = match role.as_str() {
+            "user" => "user",
+            "system" => "system",
+            _ => "assistant",
+        };
         let role_display = match role.as_str() {
             "user" => "👤 User",
             "assistant" => "🤖 Assistant",
@@ -6525,14 +6603,20 @@ fn format_as_html(
             _ => "💬 Message",
         };
 
+        // All messages are collapsible via <details>
+        // User + Assistant expanded by default; System + unknown collapsed
+        let open_attr = if role == "user" || role == "assistant" {
+            " open"
+        } else {
+            ""
+        };
         html.push_str(&format!(
-            r#"    <div class="message {role_class}">
-        <div class="role">{role_display}</div>
-        <div class="content">"#
+            r#"    <details class="message {role_class}"{open_attr}>
+        <summary class="role">{role_display}</summary>
+        <div class="content markdown">"#
         ));
 
-        // Use extract_text_content for consistent content extraction
-        let content = extract_text_content(msg);
+        // Content will be rendered as markdown by client-side JS
         html.push_str(&html_escape(&content));
 
         // Also handle tool use blocks if requested
@@ -6555,9 +6639,23 @@ fn format_as_html(
             }
         }
 
-        html.push_str("</div>\n    </div>\n");
+        html.push_str("</div>\n    </details>\n");
     }
-    html.push_str("</body>\n</html>\n");
+
+    // Add script to render markdown content with DOMPurify for XSS protection
+    html.push_str(
+        r#"    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+    <script>
+        document.querySelectorAll('.content.markdown').forEach(el => {
+            const raw = el.textContent;
+            const rendered = marked.parse(raw);
+            el.innerHTML = DOMPurify.sanitize(rendered);
+        });
+    </script>
+</body>
+</html>
+"#,
+    );
     html
 }
 
@@ -6749,6 +6847,12 @@ fn extract_text_content(msg: &serde_json::Value) -> String {
 
 /// Extract role from message (supports various formats)
 fn extract_role(msg: &serde_json::Value) -> String {
+    // Check for isMeta flag (Claude Code skill/command expansions)
+    // These should be labeled as "system" not "user"
+    if msg.get("isMeta").and_then(|m| m.as_bool()) == Some(true) {
+        return "system".to_string();
+    }
+
     // Try direct role
     if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
         return role.to_string();
